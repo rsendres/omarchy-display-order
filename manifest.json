@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-display-order.display-order",
+  "name": "Omarchy Display Order",
+  "version": "1.0.0",
+  "author": "Omarchy Display Order contributors",
+  "license": "MIT",
+  "description": "Drag-and-drop display ordering with persistent, scale-aware Hyprland layouts.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchy Display Order",
+    "description": "Drag-and-drop display ordering with persistent, scale-aware Hyprland layouts.",
+    "category": "System",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.monitor"
+  }
+}

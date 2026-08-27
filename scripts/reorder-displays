@@ -1,0 +1,637 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runtime rollback state is intentionally separate from the persistent order.
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/omarchy-display-order.display-order"
+rollback_file="$runtime_dir/reorder-displays-last.json"
+lock_file="$runtime_dir/reorder-displays.lockfile"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+order_dir="$state_home/omarchy/omarchy-display-order.display-order"
+order_file="$order_dir/order.json"
+
+usage() {
+  printf 'Usage:\n  %s --dry-run MONITOR [MONITOR ...]\n  %s --apply-live MONITOR [MONITOR ...]\n  %s --save-order MONITOR [MONITOR ...]\n  %s --apply-saved\n  %s --restore-base-workspaces\n  %s --set-scale PRESET\n  %s --print-config-block\n  %s --sync-config\n  %s --remove-config-block\n  %s --restore-last\n' "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" >&2
+  exit 2
+}
+fail() { printf 'reorder-displays: %s\n' "$*" >&2; exit 1; }
+trim_number() {
+  awk -v value="$1" 'BEGIN {
+    number = sprintf("%.6f", value)
+    sub(/0+$/, "", number)
+    sub(/\.$/, "", number)
+    printf "%s", number
+  }'
+}
+
+acquire_lock() {
+  umask 077
+  mkdir -p "$runtime_dir"
+  # An advisory FD lock is released by the kernel if Quickshell reloads the
+  # plugin and terminates this helper. A mkdir lock can otherwise be orphaned
+  # forever before its EXIT trap gets a chance to remove the directory.
+  exec {lock_fd}>"$lock_file" || fail 'could not open display reorder lock'
+  flock -n "$lock_fd" || fail 'another display reorder is already in progress'
+  trap 'flock -u "$lock_fd" 2>/dev/null || true' EXIT
+}
+require_tools() {
+  command -v hyprctl >/dev/null || fail 'hyprctl is required'
+  command -v jq >/dev/null || fail 'jq is required'
+  command -v flock >/dev/null || fail 'flock is required'
+}
+require_jq() { command -v jq >/dev/null || fail 'jq is required'; }
+require_luac() { command -v luac >/dev/null || fail 'luac is required to validate monitors.lua'; }
+
+validate_names() {
+  local name
+  declare -A seen=()
+  for name in "$@"; do
+    [[ $name =~ ^[A-Za-z0-9._:-]+$ ]] || fail "unsafe monitor name: $name"
+    [[ -z ${seen[$name]:-} ]] || fail "monitor was specified more than once: $name"
+    seen[$name]=1
+  done
+}
+
+save_order() {
+  local temp_file
+  validate_names "$@"
+  umask 077
+  mkdir -p "$order_dir" || fail "could not create state directory: $order_dir"
+  chmod 700 "$order_dir" 2>/dev/null || true
+  temp_file=$(mktemp "$order_dir/.order.json.XXXXXX") || fail 'could not create temporary order file'
+  if ! jq -cn --args '$ARGS.positional' "$@" >"$temp_file"; then
+    rm -f "$temp_file"
+    fail 'could not encode display order'
+  fi
+  if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' "$temp_file" >/dev/null; then
+    rm -f "$temp_file"
+    fail 'generated order state is invalid'
+  fi
+  mv -f "$temp_file" "$order_file" || { rm -f "$temp_file"; fail 'could not atomically save display order'; }
+  printf 'Saved display order to %s\n' "$order_file"
+}
+
+read_saved_order() {
+  [[ -r $order_file ]] || fail "no saved display order at $order_file"
+  jq -ce 'if type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9._:-]+$")) then . else error("invalid order") end' "$order_file" \
+    || fail "saved display order is invalid: $order_file"
+}
+
+# JSON quoting produces valid Lua strings for output, mode and position.
+monitor_lua() {
+  jq -r '.[] |
+    "hl.monitor({ output = " + (.name | @json) +
+    ", mode = " + ((.width | tostring) + "x" + (.height | tostring) + "@" + (.refreshRate | tostring) | @json) +
+    ", position = " + ((.x | tostring) + "x" + (.y | tostring) | @json) +
+    ", scale = " + (.scale | tostring) +
+    ", transform = " + (.transform | tostring) + " })"'
+}
+apply_layout() {
+  local lua output
+  lua=$(monitor_lua <<<"$1") || return 1
+  [[ -n $lua ]] || return 1
+  if ! output=$(hyprctl eval "$lua" 2>&1); then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
+# This is intentionally the same clean-scale rule as
+# omarchy-hyprland-monitor-scaling. The UI's 1.6 preset therefore becomes the
+# mode-valid 1.66667 scale on a 1600x900 output.
+clean_scale() {
+  awk -v scale="$1" -v width="$2" -v height="$3" '
+    function gcd(a, b, t) { while (b) { t = a % b; a = b; b = t } return a }
+    BEGIN {
+      g = gcd(width * 120, height * 120)
+      k = int(scale * 120 + 0.5)
+      if (k > g) k = g
+      while (g % k != 0) k++
+      printf "%g\n", k / 120
+    }'
+}
+
+validate_scale_preset() {
+  local scale=$1
+  [[ $scale =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "invalid scale: $scale"
+  awk -v scale="$scale" 'BEGIN { exit !(scale >= 1 && scale <= 4) }' || fail "scale is outside the supported range: $scale"
+}
+
+monitor_auto_right_lua() {
+  jq -r 'to_entries[] |
+    "hl.monitor({ output = " + (.value.name | @json) +
+    ", mode = " + ((.value.width | tostring) + "x" + (.value.height | tostring) + "@" + (.value.refreshRate | tostring) | @json) +
+    ", position = " + (if .key == 0 then "0x0" else "auto-right" end | @json) +
+    ", scale = " + (.value.scale | tostring) +
+    ", transform = " + (.value.transform | tostring) + " })"'
+}
+
+apply_scale_layout() {
+  local expected=$1 focus=$2 lua focus_code output
+  lua=$(monitor_auto_right_lua <<<"$expected") || return 1
+  [[ -n $lua ]] || return 1
+  focus_code=$(focus_lua "$focus" || true)
+  [[ -z $focus_code ]] || lua+=$'\n'"$focus_code"
+  if ! output=$(hyprctl eval "$lua" 2>&1); then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
+# Persist only Omarchy's existing global variable. disable_autoreload avoids
+# re-running its unchanged fallback (position = "auto") after the live batch.
+persist_global_scale() {
+  local scale=$1 monitor_lua temp_file previous_autoreload
+  monitor_lua="${HOME}/.config/hypr/monitors.lua"
+  [[ -f $monitor_lua ]] || fail "missing Omarchy monitor config: $monitor_lua"
+  grep -q '^local omarchy_monitor_scale = ' "$monitor_lua" || fail "Omarchy global scale variable is unavailable"
+
+  previous_autoreload=$(hyprctl -j getoption misc.disable_autoreload 2>/dev/null | jq -r '.bool')
+  [[ $previous_autoreload == true || $previous_autoreload == false ]] || fail 'could not read Hyprland auto-reload state'
+  hyprctl eval 'hl.config({ misc = { disable_autoreload = true } })' >/dev/null || fail 'could not pause Hyprland auto-reload'
+
+  temp_file=$(mktemp "${monitor_lua}.omarchy-display-order.XXXXXX") || {
+    hyprctl eval "hl.config({ misc = { disable_autoreload = $previous_autoreload } })" >/dev/null || true
+    fail 'could not create temporary monitor config'
+  }
+  if ! sed -E "s|^local omarchy_monitor_scale = .*|local omarchy_monitor_scale = ${scale}|" "$monitor_lua" >"$temp_file" \
+      || ! grep -q "^local omarchy_monitor_scale = ${scale}$" "$temp_file" \
+      || ! mv -f "$temp_file" "$monitor_lua"; then
+    rm -f "$temp_file"
+    hyprctl eval "hl.config({ misc = { disable_autoreload = $previous_autoreload } })" >/dev/null || true
+    fail 'could not atomically persist Omarchy global scale'
+  fi
+  hyprctl eval "hl.config({ misc = { disable_autoreload = $previous_autoreload } })" >/dev/null \
+    || fail 'could not restore Hyprland auto-reload state'
+}
+
+# hyprctl eval receives a dispatcher expression; execute the modern dispatcher
+# object explicitly. This is the same hl.dsp API used by the active bindings.
+workspace_move_lua() {
+  jq -r '.[] | "hl.dispatch(hl.dsp.workspace.move({ workspace = " + (.workspaceId | tostring) + ", monitor = " + (.monitor | @json) + " }))"' <<<"$1"
+}
+
+workspace_focus_lua() {
+  jq -r '.[] | "hl.dispatch(hl.dsp.focus({ workspace = " + (.workspaceId | tostring) + " }))"' <<<"$1"
+}
+
+focus_lua() {
+  local focus=$1
+  if jq -e '.activeWindowAddress != null and (.activeWindowAddress | test("^0x[1-9A-Fa-f][0-9A-Fa-f]*$"))' <<<"$focus" >/dev/null; then
+    jq -r '"hl.dispatch(hl.dsp.focus({ window = " + (.activeWindowAddress | @json) + " }))"' <<<"$focus"
+  elif jq -e '.focusedMonitor != null' <<<"$focus" >/dev/null; then
+    jq -r '"hl.dispatch(hl.dsp.focus({ monitor = " + (.focusedMonitor | @json) + " }))"' <<<"$focus"
+  fi
+}
+
+capture_reorder_focus() {
+  local active_window_json=$1
+  focused_state=$(jq -ce --argjson active "$active_window_json" '
+    ([ .[] | select(.focused // false) ] | first) as $focused
+    | {
+        focusedMonitor: ($focused.name // null),
+        activeWindowAddress: ($active.address // null)
+      }
+  ' <<<"$monitors_json") || return 1
+}
+
+restore_workspace_slots() {
+  local current_json=$1 involved_json=${2:-null} current_slots moves lua output focus_code
+  local move_failed=false focus_failed=false
+
+  current_slots=$(jq -ce --argjson involved "$involved_json" '
+    [ .[]
+      | select($involved == null or (.name as $name | $involved | index($name)))
+      | select((.disabled // false) | not)
+      | select((.mirrorOf // "none") == "none" or (.mirrorOf // "none") == "")
+      | { monitor: .name, x, workspaceId: (.activeWorkspace.id // 0) }
+    ]
+    | sort_by([.x, .monitor])
+    | to_entries
+    | map({ slot: .key, monitor: .value.monitor, workspaceId: .value.workspaceId })
+  ' <<<"$current_json") || {
+    printf 'reorder-displays: could not determine workspace slots\n' >&2
+    return 1
+  }
+
+  # The final logical order defines only the base workspaces: slot 0 gets
+  # workspace 1, slot 1 gets workspace 2, and so on. Other workspaces are
+  # never selected or redistributed here.
+  [[ $(jq 'length' <<<"$current_slots") -gt 0 ]] || return 0
+  moves=$(jq -ce '
+    map(select(.workspaceId != (.slot + 1))
+      | { workspaceId: (.slot + 1), monitor, slot })
+  ' <<<"$current_slots") || {
+    printf 'reorder-displays: could not prepare workspace transfer\n' >&2
+    return 1
+  }
+
+  [[ $(jq 'length' <<<"$moves") -gt 0 ]] || return 0
+  printf 'Restoring base workspaces by logical slot...\n'
+  while IFS= read -r lua; do
+    if ! output=$(hyprctl eval "$lua" 2>&1); then
+      printf 'reorder-displays: workspace transfer failed: %s\n' "$output" >&2
+      move_failed=true
+    fi
+  done < <(workspace_move_lua "$moves")
+
+  # Moving a workspace changes its monitor but does not necessarily make it
+  # active there. Activate each moved base workspace before restoring focus.
+  if [[ $move_failed == false ]]; then
+    while IFS= read -r lua; do
+      if ! output=$(hyprctl eval "$lua" 2>&1); then
+        printf 'reorder-displays: workspace activation failed: %s\n' "$output" >&2
+        move_failed=true
+      fi
+    done < <(workspace_focus_lua "$moves")
+  fi
+
+  # Moving a workspace may make Hyprland focus a destination temporarily.
+  # Restore the active window when possible; that also restores its workspace
+  # and monitor. If no window was active, restore the original monitor.
+  focus_code=$(focus_lua "$focused_state" || true)
+  if [[ -n $focus_code ]] && ! output=$(hyprctl eval "$focus_code" 2>&1); then
+    printf 'reorder-displays: could not restore focus: %s\n' "$output" >&2
+    focus_failed=true
+  fi
+  if [[ $move_failed == true || $focus_failed == true ]]; then
+    printf 'reorder-displays: monitor layout remains applied; refresh state after workspace/focus transfer errors\n' >&2
+    return 1
+  fi
+}
+verify_layout() {
+  local expected=$1 actual
+  actual=$(hyprctl -j monitors all) || return 1
+  jq -e --argjson expected "$expected" '
+    def close_enough(a; b): ((a - b) | fabs) < 0.01;
+    . as $actual |
+    reduce $expected[] as $wanted (true;
+      . and ([ $actual[] | select(
+        .name == $wanted.name
+        and close_enough(.x; $wanted.x) and close_enough(.y; $wanted.y)
+        and (.width == $wanted.width) and (.height == $wanted.height)
+        and close_enough(.refreshRate; $wanted.refreshRate)
+        and close_enough(.scale; $wanted.scale) and (.transform == $wanted.transform)
+        and ((.disabled // false) == ($wanted.disabled // false))
+        and ((.mirrorOf // "none") == ($wanted.mirrorOf // "none"))
+      ) ] | length == 1)
+    )' <<<"$actual" >/dev/null
+}
+restore_snapshot() {
+  local snapshot=$1
+  apply_layout "$snapshot" || { printf 'reorder-displays: restore command failed\n' >&2; return 1; }
+  verify_layout "$snapshot" || { printf 'reorder-displays: restore could not be verified\n' >&2; return 1; }
+}
+save_snapshot() {
+  local temp_file
+  temp_file=$(mktemp "$runtime_dir/reorder-displays-last.XXXXXX")
+  printf '%s\n' "$1" >"$temp_file"
+  mv -f "$temp_file" "$rollback_file"
+}
+
+prepare_plan() {
+  local name monitor disabled mirror_of width height scale transform horizontal_pixels logical_width
+  validate_names "$@"
+
+  # Names from the UI/state are an order only; Hyprland is the source of all
+  # current properties and coordinates immediately before this calculation.
+  for name in "$@"; do
+    monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json") || fail "monitor not found: $name"
+    jq -e '(.width|type == "number") and (.height|type == "number") and (.x|type == "number") and (.y|type == "number") and (.refreshRate|type == "number") and (.scale|type == "number" and . > 0) and (.transform|type == "number")' <<<"$monitor" >/dev/null || fail "invalid monitor data for: $name"
+    disabled=$(jq -r '.disabled // false' <<<"$monitor")
+    mirror_of=$(jq -r '.mirrorOf // "none"' <<<"$monitor")
+    [[ $disabled != true ]] || fail "refusing disabled monitor $name; it has no safe live-layout semantics"
+    [[ $mirror_of == none || -z $mirror_of ]] || fail "refusing mirrored monitor $name (mirrorOf=$mirror_of); its source/target must be handled explicitly"
+  done
+
+  snapshot=$(jq -ce --args '[.[] | select(.name as $name | $ARGS.positional | index($name)) | {name, width, height, refreshRate, x, y, scale, transform, disabled:(.disabled // false), mirrorOf:(.mirrorOf // "none")} ]' "$@" <<<"$monitors_json") || fail 'could not build rollback snapshot'
+  base_x=$(jq -r --args '[.[] | select(.name as $name | $ARGS.positional | index($name)) | .x] | min' "$@" <<<"$monitors_json")
+
+  plan='[]'
+  next_x=$base_x
+  for name in "$@"; do
+    monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json")
+    width=$(jq -r '.width' <<<"$monitor")
+    height=$(jq -r '.height' <<<"$monitor")
+    scale=$(jq -r '.scale' <<<"$monitor")
+    transform=$(jq -r '.transform' <<<"$monitor")
+    if [[ $transform =~ ^(1|3|5|7)$ ]]; then horizontal_pixels=$height; else horizontal_pixels=$width; fi
+    logical_width=$(trim_number "$(awk -v pixels="$horizontal_pixels" -v scale="$scale" 'BEGIN { printf "%.6f", pixels / scale }')")
+    next_x=$(trim_number "$next_x")
+    plan=$(jq -ce --argjson monitor "$monitor" --argjson x "$next_x" '. + [$monitor + {x: $x, disabled: ($monitor.disabled // false), mirrorOf: ($monitor.mirrorOf // "none")} ]' <<<"$plan") || fail "could not calculate layout for: $name"
+    next_x=$(awk -v x="$next_x" -v width="$logical_width" 'BEGIN { printf "%.6f", x + width }')
+  done
+}
+
+order_for_current_monitors() {
+  local saved_json eligible_json name
+  local -a ordered=()
+  declare -A eligible=()
+  declare -A included=()
+
+  saved_json=$(read_saved_order)
+  eligible_json=$(jq -ce '[.[] | select((.disabled // false) | not) | select((.mirrorOf // "none") == "none" or (.mirrorOf // "none") == "")] | sort_by([.x, .name])' <<<"$monitors_json") || fail 'could not determine eligible monitors'
+  [[ $(jq 'length' <<<"$eligible_json") -gt 0 ]] || fail 'no enabled, non-mirrored monitors are available'
+
+  while IFS= read -r name; do eligible[$name]=1; done < <(jq -r '.[].name' <<<"$eligible_json")
+  while IFS= read -r name; do
+    if [[ -n ${eligible[$name]:-} && -z ${included[$name]:-} ]]; then
+      ordered+=("$name")
+      included[$name]=1
+    elif [[ -z ${eligible[$name]:-} ]]; then
+      printf 'reorder-displays: saved monitor is not currently eligible and will be skipped: %s\n' "$name" >&2
+    fi
+  done < <(jq -r '.[]' <<<"$saved_json")
+  while IFS= read -r name; do
+    if [[ -z ${included[$name]:-} ]]; then
+      ordered+=("$name")
+      included[$name]=1
+      printf 'reorder-displays: newly eligible monitor appended after saved order: %s\n' "$name" >&2
+    fi
+  done < <(jq -r '.[].name' <<<"$eligible_json")
+
+  ((${#ordered[@]} > 0)) || fail 'saved order has no currently eligible monitors'
+  printf '%s\n' "${ordered[@]}"
+}
+
+apply_prepared_plan() {
+  save_snapshot "$snapshot"
+  printf 'Applying live display order...\n'
+  if ! apply_layout "$plan"; then
+    printf 'reorder-displays: live apply failed; attempting automatic restore\n' >&2
+    restore_snapshot "$snapshot" || true
+    return 1
+  fi
+  if ! verify_layout "$plan"; then
+    printf 'reorder-displays: live layout verification failed; attempting automatic restore\n' >&2
+    restore_snapshot "$snapshot" || true
+    return 1
+  fi
+  if [[ $mode == --apply-live ]]; then
+    local post_layout_json
+    if post_layout_json=$(hyprctl -j monitors all); then
+      # Workspace transfer errors intentionally do not invalidate or roll back
+      # an already verified monitor layout.
+      restore_workspace_slots "$post_layout_json" "$involved_monitors_json" || true
+    else
+      printf 'reorder-displays: could not refresh monitors after reorder; skipping workspace transfer\n' >&2
+    fi
+  fi
+  printf 'Live display order applied. Roll back with: %s --restore-last\n' "$0"
+}
+
+set_saved_scale() {
+  local preset=$1 actual_monitors focus active_window scale_monitor scale_width scale_height effective_scale
+  local saved_current_order_text scale_snapshot
+  local -a ordered=()
+
+  validate_scale_preset "$preset"
+  actual_monitors=$monitors_json
+  scale_monitor=$(jq -ce '.[] | select(.focused == true)' <<<"$actual_monitors") || fail 'could not determine focused monitor for scale'
+  scale_width=$(jq -r '.width' <<<"$scale_monitor")
+  scale_height=$(jq -r '.height' <<<"$scale_monitor")
+  effective_scale=$(clean_scale "$preset" "$scale_width" "$scale_height")
+
+  saved_current_order_text=$(order_for_current_monitors) || exit $?
+  mapfile -t ordered <<<"$saved_current_order_text"
+  ((${#ordered[@]} > 0)) || fail 'saved order has no active monitors'
+
+  # Capture the real pre-change layout for rollback and focus preservation.
+  scale_snapshot=$(jq -ce --args '[.[] | select(.name as $name | $ARGS.positional | index($name)) | {name, width, height, refreshRate, x, y, scale, transform, disabled:(.disabled // false), mirrorOf:(.mirrorOf // "none")}]' "${ordered[@]}" <<<"$actual_monitors") || fail 'could not capture scale rollback state'
+  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+  focused_state=$(jq -ce --argjson active "$active_window_json" '
+    ([ .[] | select(.focused // false) ] | first) as $focused
+    | { focusedMonitor: ($focused.name // null), activeWindowAddress: ($active.address // null) }
+  ' <<<"$actual_monitors") || fail 'could not capture focus before scale'
+
+  # Reuse the existing logical-width calculation, but substitute the new
+  # global scale before planning. Its numeric x values are verification facts;
+  # the live batch below intentionally uses 0x0 + auto-right instead.
+  monitors_json=$(jq -ce --argjson scale "$effective_scale" --args '
+    ($ARGS.positional) as $ordered
+    | map(if (.name as $name | $ordered | index($name)) then .scale = $scale else . end)
+  ' "${ordered[@]}" <<<"$actual_monitors") || fail 'could not prepare scale layout'
+  prepare_plan "${ordered[@]}"
+  plan=$(jq -ce --argjson base "$base_x" 'map(.x = (.x - $base) | .y = 0)' <<<"$plan") || fail 'could not normalize scale layout origin'
+
+  save_snapshot "$scale_snapshot"
+  printf 'Applying scale and saved display order...\n'
+  if ! apply_scale_layout "$plan" "$focused_state"; then
+    printf 'reorder-displays: scale/layout command failed; attempting automatic restore\n' >&2
+    restore_snapshot "$scale_snapshot" || true
+    return 1
+  fi
+  if ! verify_layout "$plan"; then
+    printf 'reorder-displays: scale/layout verification failed; attempting automatic restore\n' >&2
+    restore_snapshot "$scale_snapshot" || true
+    return 1
+  fi
+
+  persist_global_scale "$effective_scale"
+  if ! verify_layout "$plan"; then
+    fail 'Hyprland layout changed while persisting global scale'
+  fi
+  printf 'Scale and saved display order applied.\n'
+}
+
+config_begin_marker='-- BEGIN omarchy-display-order.display-order managed order'
+config_end_marker='-- END omarchy-display-order.display-order managed order'
+monitor_config_file() { printf '%s/.config/hypr/monitors.lua' "$HOME"; }
+
+# The persisted block intentionally represents only the saved order. Disabled,
+# mirrored, and disconnected outputs have no safe live rule; retain order.json
+# and let the untouched Omarchy fallback handle them until the next sync.
+config_order_for_active_monitors() {
+  local saved_json name monitor disabled mirror_of
+  saved_json=$(read_saved_order)
+  while IFS= read -r name; do
+    monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json") || {
+      printf 'reorder-displays: saved monitor is disconnected and omitted from config block: %s\n' "$name" >&2
+      continue
+    }
+    disabled=$(jq -r '.disabled // false' <<<"$monitor")
+    mirror_of=$(jq -r '.mirrorOf // "none"' <<<"$monitor")
+    if [[ $disabled == true || ( $mirror_of != none && -n $mirror_of ) ]]; then
+      printf 'reorder-displays: saved monitor is not eligible and omitted from config block: %s\n' "$name" >&2
+      continue
+    fi
+    printf '%s\n' "$name"
+  done < <(jq -r '.[]' <<<"$saved_json")
+}
+
+generate_config_block() {
+  local order_text name monitor transform index=0
+  order_text=$(config_order_for_active_monitors) || return 1
+  [[ -n $order_text ]] || fail 'no saved monitors are currently eligible for a config block'
+
+  printf '%s\n' "$config_begin_marker"
+  while IFS= read -r name; do
+    monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json") || return 1
+    transform=$(jq -r '.transform' <<<"$monitor")
+    jq -e '.transform | type == "number"' <<<"$monitor" >/dev/null || fail "invalid transform for: $name"
+    printf 'hl.monitor({\n'
+    printf '    output = %s,\n' "$(jq -Rn --arg value "$name" '$value')"
+    printf '    mode = "preferred",\n'
+    if ((index == 0)); then
+      printf '    position = "0x0",\n'
+    else
+      printf '    position = "auto-right",\n'
+    fi
+    printf '    scale = omarchy_monitor_scale'
+    # Omitted transform follows the native generic rule. A non-zero current
+    # transform must be explicit so the specific rule cannot clear rotation.
+    if [[ $transform != 0 ]]; then
+      printf ',\n    transform = %s\n' "$transform"
+    else
+      printf '\n'
+    fi
+    printf '})\n'
+    index=$((index + 1))
+    [[ $name == "$(printf '%s\n' "$order_text" | tail -n 1)" ]] || printf '\n'
+  done <<<"$order_text"
+  printf '%s\n' "$config_end_marker"
+}
+
+managed_block_counts_are_valid() {
+  local config=$1 begin_count end_count
+  begin_count=$(grep -Fxc -- "$config_begin_marker" "$config" || true)
+  end_count=$(grep -Fxc -- "$config_end_marker" "$config" || true)
+  [[ $begin_count -eq 0 && $end_count -eq 0 ]] || [[ $begin_count -eq 1 && $end_count -eq 1 ]]
+}
+
+write_config_atomically() {
+  local config=$1 replacement=$2 operation=$3 original_hash current_hash temp_file backup timestamp
+  [[ -f $config ]] || fail "missing Hyprland monitor config: $config"
+  managed_block_counts_are_valid "$config" || fail 'managed config block markers are malformed or duplicated'
+  original_hash=$(sha256sum "$config" | awk '{print $1}') || fail 'could not hash monitors.lua'
+  temp_file=$(mktemp "${config}.omarchy-display-order.XXXXXX") || fail 'could not create temporary monitors.lua'
+
+  if [[ $operation == replace ]]; then
+    awk -v begin="$config_begin_marker" -v end="$config_end_marker" -v replacement="$replacement" '
+      $0 == begin { print replacement; inside = 1; replaced = 1; next }
+      $0 == end { if (!inside) exit 2; inside = 0; next }
+      !inside { print }
+      END { if (inside) exit 2; if (!replaced) print "\n" replacement }
+    ' "$config" >"$temp_file" || { rm -f "$temp_file"; fail 'could not generate managed config block'; }
+  else
+    awk -v begin="$config_begin_marker" -v end="$config_end_marker" '
+      $0 == begin { inside = 1; removed = 1; next }
+      $0 == end { if (!inside) exit 2; inside = 0; next }
+      !inside { print }
+      END { if (inside) exit 2 }
+    ' "$config" >"$temp_file" || { rm -f "$temp_file"; fail 'could not remove managed config block'; }
+    if ! grep -Fqx -- "$config_begin_marker" "$config"; then
+      rm -f "$temp_file"
+      printf 'No managed monitor config block is present.\n'
+      return 0
+    fi
+  fi
+
+  luac -p "$temp_file" || { rm -f "$temp_file"; fail 'generated monitors.lua is not valid Lua'; }
+  current_hash=$(sha256sum "$config" | awk '{print $1}') || { rm -f "$temp_file"; fail 'could not rehash monitors.lua'; }
+  [[ $current_hash == "$original_hash" ]] || { rm -f "$temp_file"; fail 'monitors.lua changed while preparing update'; }
+
+  timestamp=$(date +%Y%m%d-%H%M%S-%N)
+  backup="${config}.omarchy-display-order.bak.${timestamp}"
+  cp -p -- "$config" "$backup" || { rm -f "$temp_file"; fail "could not back up monitors.lua to $backup"; }
+  current_hash=$(sha256sum "$config" | awk '{print $1}') || { rm -f "$temp_file"; fail 'could not rehash monitors.lua before replacement'; }
+  [[ $current_hash == "$original_hash" ]] || { rm -f "$temp_file"; fail 'monitors.lua changed before replacement'; }
+  chmod --reference="$config" "$temp_file" || { rm -f "$temp_file"; fail 'could not preserve monitors.lua permissions'; }
+  mv -f -- "$temp_file" "$config" || { rm -f "$temp_file"; fail 'could not atomically replace monitors.lua'; }
+  printf 'Updated %s (backup: %s).\n' "$config" "$backup"
+}
+
+sync_config() {
+  local config block
+  config=$(monitor_config_file)
+  block=$(generate_config_block) || return 1
+  write_config_atomically "$config" "$block" replace
+}
+
+remove_config_block() {
+  local config
+  config=$(monitor_config_file)
+  write_config_atomically "$config" '' remove
+}
+
+[[ $# -ge 1 ]] || usage
+mode=$1
+shift
+case $mode in
+  --dry-run|--apply-live|--save-order) [[ $# -ge 1 ]] || usage ;;
+  --set-scale) [[ $# -eq 1 ]] || usage ;;
+  --apply-saved|--restore-base-workspaces|--print-config-block|--sync-config|--remove-config-block|--restore-last) [[ $# -eq 0 ]] || usage ;;
+  *) usage ;;
+esac
+
+if [[ $mode == --save-order ]]; then
+  require_jq
+  save_order "$@"
+  exit 0
+fi
+
+require_tools
+acquire_lock
+if [[ $mode == --sync-config || $mode == --remove-config-block ]]; then require_luac; fi
+
+if [[ $mode == --restore-last ]]; then
+  [[ -r $rollback_file ]] || fail "no rollback state is available at $rollback_file"
+  snapshot=$(jq -ce 'if type == "array" and length > 0 then . else empty end' "$rollback_file") || fail 'rollback state is invalid'
+  printf 'Restoring the last display layout...\n'
+  restore_snapshot "$snapshot" || fail 'restore failed; Hyprland may need manual recovery'
+  printf 'Restored the last display layout.\n'
+  exit 0
+fi
+
+# Query exactly once, immediately before calculation. Neither the UI nor the
+# saved state can supply stale geometry to Hyprland.
+monitors_json=$(hyprctl -j monitors all) || fail 'could not query Hyprland monitors'
+if [[ $mode == --print-config-block ]]; then
+  generate_config_block
+  exit 0
+fi
+if [[ $mode == --sync-config ]]; then
+  sync_config
+  exit 0
+fi
+if [[ $mode == --remove-config-block ]]; then
+  remove_config_block
+  exit 0
+fi
+if [[ $mode == --set-scale ]]; then
+  set_saved_scale "$1"
+  exit 0
+fi
+if [[ $mode == --restore-base-workspaces ]]; then
+  # This is intentionally a one-time normalization. It moves and activates
+  # only workspaces 1..N for the current left-to-right eligible monitor slots;
+  # it creates no persistent workspace rules and leaves every other workspace
+  # alone. Capture focus immediately before the dispatcher calls so startup
+  # retains the user's active window/monitor whenever Hyprland permits it.
+  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+  capture_reorder_focus "$active_window_json" || fail 'could not capture focus before base workspace restore'
+  restore_workspace_slots "$monitors_json" null || fail 'base workspace restore failed; monitor layout remains applied'
+  printf 'Base workspaces restored by logical monitor slot.\n'
+  exit 0
+fi
+if [[ $mode == --apply-saved ]]; then
+  saved_current_order_text=$(order_for_current_monitors) || exit $?
+  mapfile -t saved_current_order <<<"$saved_current_order_text"
+  prepare_plan "${saved_current_order[@]}"
+else
+  prepare_plan "$@"
+fi
+
+if [[ $mode == --apply-live ]]; then
+  involved_monitors_json=$(jq -cn --args '$ARGS.positional' "$@") || fail 'could not record involved monitors'
+  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+  capture_reorder_focus "$active_window_json" || fail 'could not capture focus before reorder'
+fi
+
+if [[ $mode == --dry-run ]]; then
+  printf 'DRY-RUN: Hyprland layout remains unchanged.\n'
+  printf 'Base x (leftmost requested active monitor): %s\n' "$base_x"
+  jq -r '.[] | "\(.name): x=\(.x) y=\(.y) width=\(.width) height=\(.height) scale=\(.scale) transform=\(.transform) refreshRate=\(.refreshRate) disabled=\(.disabled) mirrorOf=\(.mirrorOf)"' <<<"$plan"
+  exit 0
+fi
+
+apply_prepared_plan

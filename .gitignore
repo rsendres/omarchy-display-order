@@ -1,0 +1,15 @@
+# Runtime and persistent display state
+order.json
+reorder-displays-last.json
+*.log
+
+# Backups and temporary files produced while updating monitors.lua
+monitors.lua.*.bak.*
+*.bak
+*.bak.*
+*.tmp
+*.swp
+*~
+
+# Local tooling
+.direnv/
