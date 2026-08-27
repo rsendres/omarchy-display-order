@@ -24,11 +24,16 @@ Panel {
   property var displays: []
   property int enabledDisplayCount: 0
   property bool displayReorderApplying: false
+  property bool displayDragActive: false
   property var displaysBeforeLiveReorder: []
+  // The order submitted for a drop is a snapshot.  It must not be rebuilt from
+  // root.displays while the compositor/helper is changing state.
+  property var pendingDisplayOrder: []
   property string displayReorderError: ""
   property int scaleGeneration: 0
   property string queuedScale: ""
   property bool actionIsScale: false
+  readonly property bool actionProcessRunning: actionProc.running
   property bool refreshPending: false
   property bool brightnessRefreshPending: false
   property int stateRefreshRetries: 0
@@ -239,6 +244,10 @@ Panel {
   }
 
   function refresh() {
+    if (root.displayDragActive || root.displayReorderApplying || root.actionProcessRunning) {
+      root.refreshPending = true
+      return
+    }
     if (stateProc.running) {
       root.refreshPending = true
       return
@@ -276,6 +285,8 @@ Panel {
       displaySummary.push({
         name: monitor.name,
         enabled: monitor.disabled !== true,
+        disabled: monitor.disabled === true,
+        mirrorOf: monitor.mirrorOf || "",
         focused: monitor.focused === true,
         width: monitor.width,
         height: monitor.height
@@ -356,27 +367,69 @@ Panel {
 
   // DelegateModel owns the live visual order while dragging. Invoke the helper
   // only after drop; the panel supplies names/order, never coordinates.
+  function isDisplayReorderEligible(display) {
+    if (!display || !display.enabled || display.disabled === true) return false
+    return display.mirrorOf === undefined || display.mirrorOf === null
+      || display.mirrorOf === "" || display.mirrorOf === "none"
+  }
+
+  function consumePendingDisplayRefresh() {
+    if (root.refreshPending) root.refresh()
+  }
+
   function applyVisualDisplayOrder() {
     if (displayReorderApplying) return
+    if (root.actionProcessRunning) {
+      root.displays = root.displays.slice()
+      root.refreshPending = true
+      return
+    }
     var reordered = []
+    var eligible = []
     for (var i = 0; i < displayList.count; i++) {
       var item = displayList.itemAtIndex(i)
-      if (item && item.display) reordered.push(item.display)
+      if (item && item.display) {
+        reordered.push(item.display)
+        if (root.isDisplayReorderEligible(item.display)) eligible.push(item.display)
+      }
     }
-    if (reordered.length !== root.displays.length) return
+    if (reordered.length !== root.displays.length) {
+      root.displays = root.displays.slice()
+      root.consumePendingDisplayRefresh()
+      return
+    }
+    if (eligible.length === 0) {
+      root.displays = root.displays.slice()
+      root.consumePendingDisplayRefresh()
+      return
+    }
+
+    var currentEligible = root.displays.filter(function(display) {
+      return root.isDisplayReorderEligible(display)
+    })
+    var unchanged = eligible.length === currentEligible.length
+    for (var j = 0; unchanged && j < eligible.length; j++)
+      unchanged = String(eligible[j].name) === String(currentEligible[j].name)
+    if (unchanged) {
+      root.displays = root.displays.slice()
+      root.consumePendingDisplayRefresh()
+      return
+    }
 
     displaysBeforeLiveReorder = root.displays.slice()
+    root.pendingDisplayOrder = eligible.map(function(display) {
+      return String(display.name)
+    })
     root.displays = reordered
     displayReorderError = ""
     displayReorderApplying = true
-    reorderProc.command = [reorderDisplaysHelper, "--apply-live"].concat(reordered.map(function(display) {
-      return display.name
-    }))
+    reorderProc.command = [reorderDisplaysHelper, "--apply-and-save"].concat(root.pendingDisplayOrder)
     reorderProc.running = true
   }
 
   function toggleDisplay(name, enabled) {
     if (!name) return
+    if (root.displayReorderApplying || root.displayDragActive || root.actionProcessRunning) return
     if (enabled && root.enabledDisplayCount <= 1) return
     if (actionProc.running) return
 
@@ -386,6 +439,7 @@ Panel {
   }
 
   function setScale(scale) {
+    if (root.displayReorderApplying || root.displayDragActive) return
     root.scaleGeneration += 1
     if (actionProc.running) {
       // A running CLI cannot be changed in place. Keep only the newest click;
@@ -496,7 +550,12 @@ Panel {
     command: ["hyprctl", "-j", "monitors", "all"]
     stdout: StdioCollector { id: stateOutput; waitForEnd: true }
     onExited: function(exitCode) {
-      var valid = exitCode === 0 && root.applyMonitorState(stateOutput.text)
+      var valid = false
+      if (root.displayDragActive || root.displayReorderApplying || root.actionProcessRunning) {
+        root.refreshPending = true
+      } else {
+        valid = exitCode === 0 && root.applyMonitorState(stateOutput.text)
+      }
       if (valid) {
         root.stateRefreshRetries = 0
         root.refreshBrightness()
@@ -588,63 +647,17 @@ Panel {
       var stderr = String(reorderErrorOutput.text || "").trim()
       if (exitCode !== 0) {
         root.displayReorderApplying = false
-        root.displays = root.displaysBeforeLiveReorder
+        root.displays = root.displaysBeforeLiveReorder.slice()
         var detail = stderr || stdout
         root.displayReorderError = detail !== "" ? detail : "Could not apply display order"
         console.warn("omarchy-display-order.display-order: display reorder failed (exit " + exitCode
           + ")\nstdout: " + stdout + "\nstderr: " + stderr)
-        // The helper already attempts --restore-last. Read Hyprland again so
-        // the panel reflects the compositor's actual post-rollback layout.
         root.refresh()
         return
       }
-      // Save names only after --apply-live has returned success. Keep the
-      // drag lock while this runs so the two phases cannot interleave.
-      saveOrderProc.command = [root.reorderDisplaysHelper, "--save-order"].concat(root.displays.map(function(display) {
-        return display.name
-      }))
-      saveOrderProc.running = true
-    }
-  }
-
-  Process {
-    id: saveOrderProc
-    stdout: StdioCollector { id: saveOrderOutput; waitForEnd: true }
-    stderr: StdioCollector { id: saveOrderErrorOutput; waitForEnd: true }
-    onExited: function(exitCode) {
+      console.log("omarchy-display-order.display-order: display reorder completed (exit " + exitCode
+        + ")\nstdout: " + stdout + "\nstderr: " + stderr)
       root.displayReorderApplying = false
-      var stdout = String(saveOrderOutput.text || "").trim()
-      var stderr = String(saveOrderErrorOutput.text || "").trim()
-      if (exitCode !== 0) {
-        // Live layout remains active; only the future-session preference was
-        // not saved, and no Omarchy configuration file has been touched.
-        console.warn("omarchy-display-order.display-order: display order save failed (exit " + exitCode
-          + ")\nstdout: " + stdout + "\nstderr: " + stderr)
-      }
-      if (exitCode === 0) {
-        // order.json remains authoritative. Keep its reload-safe operational
-        // representation in sync, but never undo a successful live drag if
-        // the configuration write fails.
-        syncConfigProc.command = [reorderDisplaysHelper, "--sync-config"]
-        syncConfigProc.running = true
-        return
-      }
-      root.refresh()
-    }
-  }
-
-  Process {
-    id: syncConfigProc
-    stdout: StdioCollector { id: syncConfigOutput; waitForEnd: true }
-    stderr: StdioCollector { id: syncConfigErrorOutput; waitForEnd: true }
-    onExited: function(exitCode) {
-      root.displayReorderApplying = false
-      var stdout = String(syncConfigOutput.text || "").trim()
-      var stderr = String(syncConfigErrorOutput.text || "").trim()
-      if (exitCode !== 0) {
-        console.warn("omarchy-display-order.display-order: saved order is live but monitor config sync failed (exit " + exitCode
-          + ")\nstdout: " + stdout + "\nstderr: " + stderr)
-      }
       root.refresh()
     }
   }
@@ -1070,6 +1083,8 @@ Panel {
     horizontalPadding: Style.spacing.sm
     verticalPadding: Style.spacing.controlPaddingY
     bordered: true
+    enabled: !root.displayReorderApplying && !root.displayDragActive
+    opacity: enabled ? 1.0 : 0.45
 
     active: root.activeScaleIndex() === scaleIndex
     hasCursor: root.cursorActive && root.focusSection === "scale" && root.selectedIndex === scaleIndex
@@ -1106,6 +1121,7 @@ Panel {
     property bool wasDragged: false
     property real dragCenterY: 0
     property real pointerOffsetY: 0
+    readonly property bool canReorder: root.isDisplayReorderEligible(display)
 
     implicitHeight: rowSurface.implicitHeight
     z: dragging ? 1 : 0
@@ -1123,7 +1139,8 @@ Panel {
       fill: Style.hoverFillFor(root.bar.foreground, Color.accent)
       currentFill: Style.selectedFillFor(root.bar.foreground, Color.accent)
       implicitHeight: monitorInner.implicitHeight + Style.spacing.xl
-      opacity: monitorRow.canToggle ? (monitorRow.dragging ? 0.92 : 1.0) : 0.45
+      opacity: root.displayReorderApplying ? 0.55
+        : (monitorRow.canReorder || monitorRow.canToggle ? (monitorRow.dragging ? 0.92 : 1.0) : 0.45)
 
       // On drop, return the row to the ListView slot without a hard snap.
       Behavior on y {
@@ -1187,10 +1204,10 @@ Panel {
 
       MouseArea {
         anchors.fill: parent
-        enabled: !root.displayReorderApplying
+        enabled: !root.displayReorderApplying && !root.actionProcessRunning
         hoverEnabled: true
         cursorShape: monitorRow.dragging ? Qt.ClosedHandCursor
-          : (monitorRow.canToggle ? Qt.PointingHandCursor : Qt.ArrowCursor)
+          : (monitorRow.canReorder || monitorRow.canToggle ? Qt.PointingHandCursor : Qt.ArrowCursor)
         onContainsMouseChanged: if (containsMouse && !root.reflowingText) {
           root.cursorActive = true
           root.focusSection = "monitors"
@@ -1199,6 +1216,7 @@ Panel {
         property real pressY: 0
 
         onPressed: function(mouse) {
+          root.displayDragActive = true
           pressY = mouse.y
           monitorRow.dragging = false
           monitorRow.wasDragged = false
@@ -1207,10 +1225,12 @@ Panel {
         }
         onPositionChanged: function(mouse) {
           if (!pressed) return
-          if (!monitorRow.dragging && Math.abs(mouse.y - pressY) >= Style.space(6)) {
+          if (!monitorRow.dragging && monitorRow.canReorder
+              && Math.abs(mouse.y - pressY) >= Style.space(6)) {
             var initialPoint = rowSurface.mapToItem(displayList.contentItem, mouse.x, mouse.y)
             monitorRow.dragCenterY = initialPoint.y - monitorRow.pointerOffsetY + rowSurface.height / 2
             monitorRow.dragging = true
+            root.displayDragActive = true
           }
           if (!monitorRow.dragging) return
 
@@ -1242,7 +1262,15 @@ Panel {
         onReleased: {
           monitorRow.wasDragged = monitorRow.dragging
           monitorRow.dragging = false
+          root.displayDragActive = false
           if (monitorRow.wasDragged) root.applyVisualDisplayOrder()
+          else root.consumePendingDisplayRefresh()
+        }
+        onCanceled: {
+          monitorRow.dragging = false
+          root.displayDragActive = false
+          root.displays = root.displays.slice()
+          root.consumePendingDisplayRefresh()
         }
         onClicked: {
           if (!monitorRow.wasDragged && monitorRow.canToggle)

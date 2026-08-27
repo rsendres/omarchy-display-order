@@ -22,12 +22,6 @@ Item {
     applySavedProc.running = true
   }
 
-  function startRestoreBaseWorkspaces() {
-    if (restoreBaseWorkspacesProc.running) return
-    restoreBaseWorkspacesProc.command = [reorderDisplaysHelper, "--restore-base-workspaces"]
-    restoreBaseWorkspacesProc.running = true
-  }
-
   // Do not invoke the helper at all until a user has saved an order. This also
   // makes a first installation a no-op rather than an output reconfiguration.
   Component.onCompleted: {
@@ -54,38 +48,24 @@ Item {
       var stdout = String(applySavedOutput.text || "").trim()
       var stderr = String(applySavedError.text || "").trim()
       if (exitCode === 0) {
-        root.startRestoreBaseWorkspaces()
+        if (stderr !== "") {
+          console.warn("omarchy-display-order.display-order: --apply-saved completed with diagnostics\n"
+            + stderr)
+        }
         return
       }
 
-      // At shell startup Hyprland's IPC socket can briefly be unavailable.
-      // Retry only that identifiable transient failure, at a calm fixed delay.
+      // At shell startup Hyprland's IPC socket can briefly be unavailable, or
+      // another helper can briefly hold the advisory lock. Retry only those
+      // identifiable transient failures, at a calm fixed delay.
       var socketUnavailable = stderr.indexOf("could not query Hyprland monitors") !== -1
-      if (socketUnavailable && root.socketAttempts < root.maxSocketAttempts) {
+      var lockBusy = stderr.indexOf("another display reorder is already in progress") !== -1
+      if ((socketUnavailable || lockBusy) && root.socketAttempts < root.maxSocketAttempts) {
         startupRetry.restart()
         return
       }
       console.warn("omarchy-display-order.display-order service: saved display order was not applied (exit " + exitCode
         + ")\nstdout: " + stdout + "\nstderr: " + stderr)
-    }
-  }
-
-  // Run only after --apply-saved has succeeded. The helper acquires the same
-  // flock as the layout operation, so this is serialized both here and with
-  // any concurrent panel operation.
-  Process {
-    id: restoreBaseWorkspacesProc
-    stdout: StdioCollector { id: restoreBaseWorkspacesOutput; waitForEnd: true }
-    stderr: StdioCollector { id: restoreBaseWorkspacesError; waitForEnd: true }
-    onExited: function(exitCode) {
-      var stdout = String(restoreBaseWorkspacesOutput.text || "").trim()
-      var stderr = String(restoreBaseWorkspacesError.text || "").trim()
-      if (exitCode === 0) {
-        return
-      }
-      console.warn("omarchy-display-order.display-order service: base workspace restore failed (exit " + exitCode
-        + ")\nstdout: " + stdout + "\nstderr: " + stderr
-        + "\nThe saved display layout remains applied.")
     }
   }
 
