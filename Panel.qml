@@ -34,6 +34,10 @@ Panel {
   property string queuedScale: ""
   property bool actionIsScale: false
   readonly property bool actionProcessRunning: actionProc.running
+  property string monitorIdentifyTarget: ""
+  property var monitorIdentifyDisplay: null
+  property int monitorIdentifyOrdinal: 0
+  property bool monitorIdentifyVisible: false
   property bool refreshPending: false
   property bool brightnessRefreshPending: false
   property int stateRefreshRetries: 0
@@ -377,6 +381,76 @@ Panel {
     if (root.refreshPending) root.refresh()
   }
 
+  function cancelMonitorIdentify() {
+    monitorIdentifyTimer.stop()
+    root.monitorIdentifyVisible = false
+    root.monitorIdentifyTarget = ""
+    root.monitorIdentifyDisplay = null
+    root.monitorIdentifyOrdinal = 0
+  }
+
+  function cancelMonitorIdentifyFor(display) {
+    if (display && display === root.monitorIdentifyDisplay)
+      root.cancelMonitorIdentify()
+  }
+
+  function reconcileMonitorIdentify() {
+    if (root.monitorIdentifyTarget === "") return
+    if (root.displayDragActive || root.displayReorderApplying || root.actionProcessRunning) {
+      root.cancelMonitorIdentify()
+      return
+    }
+    for (var i = 0; i < root.displays.length; i++) {
+      var display = root.displays[i]
+      if (display && String(display.name) === root.monitorIdentifyTarget
+          && root.isDisplayReorderEligible(display)) {
+        root.monitorIdentifyOrdinal = i + 1
+        root.monitorIdentifyDisplay = display
+        return
+      }
+    }
+    root.cancelMonitorIdentify()
+  }
+
+  function startMonitorIdentify(display, ordinal) {
+    if (!root.opened || root.displayDragActive || root.displayReorderApplying
+        || root.actionProcessRunning || !root.isDisplayReorderEligible(display)) {
+      root.cancelMonitorIdentifyFor(display)
+      return
+    }
+    if (!display.name || ordinal < 1) return
+    if (root.monitorIdentifyTarget !== String(display.name))
+      root.cancelMonitorIdentify()
+    root.monitorIdentifyTarget = String(display.name)
+    root.monitorIdentifyDisplay = display
+    root.monitorIdentifyOrdinal = ordinal
+    if (!root.monitorIdentifyVisible && !monitorIdentifyTimer.running)
+      monitorIdentifyTimer.restart()
+  }
+
+  Timer {
+    id: monitorIdentifyTimer
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (!root.opened || root.displayDragActive || root.displayReorderApplying
+          || root.actionProcessRunning || root.monitorIdentifyTarget === "") {
+        root.cancelMonitorIdentify()
+        return
+      }
+      var stillPresent = false
+      for (var i = 0; i < root.displays.length; i++) {
+        if (String(root.displays[i].name) === root.monitorIdentifyTarget
+            && root.isDisplayReorderEligible(root.displays[i])) {
+          stillPresent = true
+          break
+        }
+      }
+      if (stillPresent) root.monitorIdentifyVisible = true
+      else root.cancelMonitorIdentify()
+    }
+  }
+
   function applyVisualDisplayOrder() {
     if (displayReorderApplying) return
     if (root.actionProcessRunning) {
@@ -420,9 +494,10 @@ Panel {
     root.pendingDisplayOrder = eligible.map(function(display) {
       return String(display.name)
     })
-    root.displays = reordered
+    root.cancelMonitorIdentify()
     displayReorderError = ""
     displayReorderApplying = true
+    root.displays = reordered
     reorderProc.command = [reorderDisplaysHelper, "--apply-and-save"].concat(root.pendingDisplayOrder)
     reorderProc.running = true
   }
@@ -433,6 +508,7 @@ Panel {
     if (enabled && root.enabledDisplayCount <= 1) return
     if (actionProc.running) return
 
+    root.cancelMonitorIdentify()
     actionIsScale = false
     actionProc.command = ["hyprctl", "keyword", "monitor", name + (enabled ? ",disable" : ",preferred,auto,auto")]
     actionProc.running = true
@@ -440,6 +516,7 @@ Panel {
 
   function setScale(scale) {
     if (root.displayReorderApplying || root.displayDragActive) return
+    root.cancelMonitorIdentify()
     root.scaleGeneration += 1
     if (actionProc.running) {
       // A running CLI cannot be changed in place. Keep only the newest click;
@@ -497,6 +574,13 @@ Panel {
   implicitHeight: button.implicitHeight
 
   Component.onCompleted: refresh()
+  Component.onDestruction: cancelMonitorIdentify()
+
+  MonitorIdentifier {
+    targetOutput: root.monitorIdentifyTarget
+    ordinal: root.monitorIdentifyOrdinal
+    identifyVisible: root.monitorIdentifyVisible
+  }
 
   // KeyboardPanel primes focus at open-time, so SUPER-bound IPC summons land
   // with j/k ready to navigate. Keep a default landing point, but don't paint
@@ -512,11 +596,14 @@ Panel {
         selectedIndex = 0
       }
       cursorActive = false
-    }
+    } else root.cancelMonitorIdentify()
   }
 
   onBrightnessAvailableChanged: clampCursor()
-  onDisplaysChanged: clampCursor()
+  onDisplaysChanged: {
+    root.reconcileMonitorIdentify()
+    clampCursor()
+  }
   onScaleValuesChanged: clampCursor()
   onVisibleSectionsChanged: clampCursor()
 
@@ -646,6 +733,7 @@ Panel {
       var stdout = String(reorderOutput.text || "").trim()
       var stderr = String(reorderErrorOutput.text || "").trim()
       if (exitCode !== 0) {
+        root.cancelMonitorIdentify()
         root.displayReorderApplying = false
         root.displays = root.displaysBeforeLiveReorder.slice()
         var detail = stderr || stdout
@@ -657,6 +745,7 @@ Panel {
       }
       console.log("omarchy-display-order.display-order: display reorder completed (exit " + exitCode
         + ")\nstdout: " + stdout + "\nstderr: " + stderr)
+      root.cancelMonitorIdentify()
       root.displayReorderApplying = false
       root.refresh()
     }
@@ -1212,10 +1301,12 @@ Panel {
           root.cursorActive = true
           root.focusSection = "monitors"
           root.selectedIndex = monitorRow.rowIndex
-        }
+          root.startMonitorIdentify(monitorRow.display, monitorRow.rowIndex + 1)
+        } else if (!containsMouse) root.cancelMonitorIdentifyFor(monitorRow.display)
         property real pressY: 0
 
         onPressed: function(mouse) {
+          root.cancelMonitorIdentify()
           root.displayDragActive = true
           pressY = mouse.y
           monitorRow.dragging = false
@@ -1227,6 +1318,7 @@ Panel {
           if (!pressed) return
           if (!monitorRow.dragging && monitorRow.canReorder
               && Math.abs(mouse.y - pressY) >= Style.space(6)) {
+            root.cancelMonitorIdentify()
             var initialPoint = rowSurface.mapToItem(displayList.contentItem, mouse.x, mouse.y)
             monitorRow.dragCenterY = initialPoint.y - monitorRow.pointerOffsetY + rowSurface.height / 2
             monitorRow.dragging = true
@@ -1260,6 +1352,7 @@ Panel {
           if (targetIndex !== fromIndex) displayVisualModel.items.move(fromIndex, targetIndex)
         }
         onReleased: {
+          root.cancelMonitorIdentify()
           monitorRow.wasDragged = monitorRow.dragging
           monitorRow.dragging = false
           root.displayDragActive = false
@@ -1267,6 +1360,7 @@ Panel {
           else root.consumePendingDisplayRefresh()
         }
         onCanceled: {
+          root.cancelMonitorIdentify()
           monitorRow.dragging = false
           root.displayDragActive = false
           root.displays = root.displays.slice()
