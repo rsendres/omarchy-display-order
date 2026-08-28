@@ -26,9 +26,12 @@ transaction_autoreload_restored=false
 transaction_active=false
 transaction_committed=false
 transaction_rollback_done=false
+startup_mode=false
+startup_claim_existing=false
+startup_claim_file=''
 
 usage() {
-  printf 'Usage:\n  %s --dry-run MONITOR [MONITOR ...]\n  %s --apply-live MONITOR [MONITOR ...]\n  %s --save-order MONITOR [MONITOR ...]\n  %s --apply-and-save MONITOR [MONITOR ...]\n  %s --apply-saved\n  %s --restore-base-workspaces\n  %s --set-scale PRESET\n  %s --print-config-block\n  %s --sync-config\n  %s --remove-config-block\n  %s --restore-last\n' "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" >&2
+  printf 'Usage:\n  %s --dry-run MONITOR [MONITOR ...]\n  %s --apply-live MONITOR [MONITOR ...]\n  %s --save-order MONITOR [MONITOR ...]\n  %s --apply-and-save MONITOR [MONITOR ...]\n  %s --startup-apply-saved\n  %s --apply-saved\n  %s --restore-base-workspaces\n  %s --set-scale PRESET\n  %s --print-config-block\n  %s --sync-config\n  %s --remove-config-block\n  %s --restore-last\n' "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" >&2
   exit 2
 }
 fail() { printf 'reorder-displays: %s\n' "$*" >&2; exit 1; }
@@ -41,6 +44,13 @@ trim_number() {
   }'
 }
 
+install_lock_traps() {
+  trap 'transaction_exit_trap' EXIT
+  trap 'transaction_signal_trap INT 130' INT
+  trap 'transaction_signal_trap TERM 143' TERM
+  trap 'transaction_signal_trap HUP 129' HUP
+}
+
 acquire_lock() {
   umask 077
   mkdir -p "$runtime_dir"
@@ -49,10 +59,23 @@ acquire_lock() {
   # forever before its EXIT trap gets a chance to remove the directory.
   exec {lock_fd}>"$lock_file" || fail 'could not open display reorder lock'
   flock -n "$lock_fd" || fail 'another display reorder is already in progress'
-  trap 'transaction_exit_trap' EXIT
-  trap 'transaction_signal_trap INT 130' INT
-  trap 'transaction_signal_trap TERM 143' TERM
-  trap 'transaction_signal_trap HUP 129' HUP
+  install_lock_traps
+}
+
+acquire_startup_lock() {
+  local attempt
+  for ((attempt = 1; attempt <= 12; attempt++)); do
+    umask 077
+    mkdir -p "$runtime_dir" || fail 'could not create display reorder runtime directory'
+    exec {lock_fd}>"$lock_file" || fail 'could not open display reorder lock'
+    if flock -n "$lock_fd"; then
+      install_lock_traps
+      return 0
+    fi
+    exec {lock_fd}>&-
+    sleep 0.2
+  done
+  fail 'another display reorder is already in progress after startup retries'
 }
 require_tools() {
   command -v hyprctl >/dev/null || fail 'hyprctl is required'
@@ -62,6 +85,35 @@ require_tools() {
 require_jq() { command -v jq >/dev/null || fail 'jq is required'; }
 require_flock() { command -v flock >/dev/null || fail 'flock is required'; }
 require_luac() { command -v luac >/dev/null || fail 'luac is required to validate monitors.lua'; }
+
+claim_startup_session() {
+  local signature hash
+  signature=${HYPRLAND_INSTANCE_SIGNATURE:-}
+  [[ -n $signature ]] || fail 'HYPRLAND_INSTANCE_SIGNATURE is required for startup apply'
+  [[ $signature =~ ^[A-Za-z0-9._:-]+$ ]] || fail 'HYPRLAND_INSTANCE_SIGNATURE contains unsafe characters'
+  command -v sha256sum >/dev/null || fail 'sha256sum is required for startup apply'
+  command -v awk >/dev/null || fail 'awk is required for startup apply'
+  [[ -n ${XDG_RUNTIME_DIR:-} ]] || fail 'XDG_RUNTIME_DIR is required for startup apply'
+
+  hash=$(printf '%s' "$signature" | sha256sum | awk '{print $1}') \
+    || fail 'could not hash Hyprland instance signature'
+  runtime_dir="$XDG_RUNTIME_DIR/omarchy-display-order.display-order"
+  mkdir -p "$runtime_dir" || fail 'could not create startup claim directory'
+  chmod 700 "$runtime_dir" || fail 'could not secure startup claim directory'
+  startup_claim_file="$runtime_dir/startup-${hash}.claim"
+
+  if [[ -e $startup_claim_file ]]; then
+    startup_claim_existing=true
+    return 0
+  fi
+  if ! (set -C; : >"$startup_claim_file") 2>/dev/null; then
+    [[ -e $startup_claim_file ]] || fail 'could not claim Hyprland startup apply'
+    startup_claim_existing=true
+    return 0
+  fi
+  chmod 600 "$startup_claim_file" || fail 'could not secure startup claim'
+  printf '%s\n' "$signature" >"$startup_claim_file" || fail 'could not record startup claim'
+}
 
 validate_names() {
   local name
@@ -604,7 +656,7 @@ apply_prepared_plan() {
     fi
     return 1
   fi
-  if [[ $mode == --apply-live || $mode == --apply-saved ]]; then
+  if [[ $mode == --apply-live || $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
     local post_layout_json
     if post_layout_json=$(hyprctl -j monitors all); then
       # Workspace transfer errors intentionally do not invalidate or roll back
@@ -802,11 +854,27 @@ remove_config_block() {
   write_config_atomically "$config" '' remove
 }
 
+query_monitors_for_mode() {
+  local attempt output
+  local max_attempts=1
+  [[ $startup_mode == true ]] && max_attempts=12
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if output=$(hyprctl -j monitors all); then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    [[ $startup_mode == true ]] || return 1
+    sleep 0.2
+  done
+  return 1
+}
+
 [[ $# -ge 1 ]] || usage
 mode=$1
 shift
 case $mode in
   --dry-run|--apply-live|--save-order|--apply-and-save) [[ $# -ge 1 ]] || usage ;;
+  --startup-apply-saved) [[ $# -eq 0 ]] || usage ;;
   --set-scale) [[ $# -eq 1 ]] || usage ;;
   --apply-saved|--restore-base-workspaces|--print-config-block|--sync-config|--remove-config-block|--restore-last) [[ $# -eq 0 ]] || usage ;;
   *) usage ;;
@@ -819,8 +887,19 @@ if [[ $mode == --save-order ]]; then
   exit 0
 fi
 
+if [[ $mode == --startup-apply-saved ]]; then
+  startup_mode=true
+  claim_startup_session
+  [[ $startup_claim_existing == true ]] && exit 0
+  [[ -r $order_file ]] || exit 0
+fi
+
 require_tools
-acquire_lock
+if [[ $startup_mode == true ]]; then
+  acquire_startup_lock
+else
+  acquire_lock
+fi
 if [[ $mode == --sync-config || $mode == --remove-config-block || $mode == --apply-and-save ]]; then require_luac; fi
 
 if [[ $mode == --restore-last ]]; then
@@ -834,7 +913,7 @@ fi
 
 # Query exactly once, immediately before calculation. Neither the UI nor the
 # saved state can supply stale geometry to Hyprland.
-monitors_json=$(hyprctl -j monitors all) || fail 'could not query Hyprland monitors'
+monitors_json=$(query_monitors_for_mode) || fail 'could not query Hyprland monitors'
 if [[ $mode == --print-config-block ]]; then
   generate_config_block
   exit 0
@@ -865,7 +944,7 @@ if [[ $mode == --restore-base-workspaces ]]; then
   printf 'Base workspaces restored by logical monitor slot.\n'
   exit 0
 fi
-if [[ $mode == --apply-saved ]]; then
+if [[ $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
   saved_current_order_text=$(order_for_current_monitors) || exit $?
   mapfile -t saved_current_order <<<"$saved_current_order_text"
   prepare_plan "${saved_current_order[@]}"
@@ -876,8 +955,8 @@ else
   prepare_plan "$@"
 fi
 
-if [[ $mode == --apply-live || $mode == --apply-and-save || $mode == --apply-saved ]]; then
-  if [[ $mode == --apply-saved ]]; then
+if [[ $mode == --apply-live || $mode == --apply-and-save || $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
+  if [[ $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
     involved_monitors_json=$(jq -cn --args '$ARGS.positional' "${saved_current_order[@]}") || fail 'could not record involved monitors'
   else
     involved_monitors_json=$(jq -cn --args '$ARGS.positional' "$@") || fail 'could not record involved monitors'

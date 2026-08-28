@@ -7,23 +7,24 @@ Drag-and-drop display ordering for Omarchy. Arrange your monitors visually and k
 Omarchy Display Order adds numbering and drag-and-drop ordering to Omarchy's **Displays** section. For example:
 
 ```text
-1 Monitor A
-2 Monitor B
+1 Monitor 1
+2 Monitor 2
 ```
 
 Dragging a row changes the logical left-to-right arrangement in Hyprland. For example:
 
 ```text
 Before:
-1 Monitor A
-2 Monitor B
+1 Monitor 1
+2 Monitor 2
 
-After dragging Monitor B upward:
-1 Monitor B
-2 Monitor A
+After dragging Monitor 2 upward:
+1 Monitor 2
+2 Monitor 1
 ```
 
 - Drag-and-drop display ordering
+- Hover-to-identify physical displays
 - Automatic logical positioning
 - Scale-aware layout calculations
 - Workspace base alignment
@@ -58,6 +59,14 @@ Open **Setup → Display**. In **DISPLAYS**, drag the numbered monitor rows into
 
 The first row becomes the leftmost logical display in Hyprland, followed by the remaining rows from left to right.
 
+### Identify a display
+
+Park the mouse pointer over a monitor row for two seconds to print its current
+list number on that physical display, in the upper-left corner. The identifier
+remains visible while the pointer stays on the row, disappears immediately on
+exit, and is disabled during drag-and-drop. It uses the Hyprland output name
+(for example, `DP-2` or `HDMI-A-1`) to select the matching physical display.
+
 ## How it works
 
 - `order.json` is the source of the preferred monitor order.
@@ -90,6 +99,7 @@ Run these checks from the plugin root:
 
 ```bash
 bash -n scripts/reorder-displays
+tests/test_reorder_displays.sh
 luac -p "$HOME/.config/hypr/monitors.lua"
 git diff --check
 omarchy plugin validate .

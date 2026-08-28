@@ -177,6 +177,7 @@ new_case() {
   export HOME="$test_root/home"
   export XDG_STATE_HOME="$test_root/state-home"
   export XDG_RUNTIME_DIR="$test_root/runtime"
+  unset HYPRLAND_INSTANCE_SIGNATURE
   export PATH="$mock_bin:/usr/bin:/bin"
   export MOCK_FAIL_APPLY=0 MOCK_FAIL_RESTORE=0 MOCK_FAIL_ORDER_MV=0 MOCK_LUAC_FAIL=0 MOCK_TOPOLOGY_CHANGE=0 MOCK_POST_SYNC_LAYOUT=0 MOCK_PAUSE_AFTER_APPLY=0 MOCK_FAIL_AUTORELOAD_RESTORE_ONCE=0
   set_fixture "$fixture"
@@ -235,6 +236,29 @@ assert_mock_log_has_no_eval() {
       fail "mock hyprctl log contains a live eval: $line"
     fi
   done <"$MOCK_LOG"
+}
+
+assert_mock_log_empty() {
+  [[ ! -s "$MOCK_LOG" ]] || fail "mock hyprctl was called: $(<"$MOCK_LOG")"
+}
+
+assert_mock_log_has_eval() {
+  local line
+  while IFS= read -r line; do
+    if [[ $line == eval\ * ]]; then
+      return 0
+    fi
+  done <"$MOCK_LOG"
+  fail 'mock hyprctl log contains no live eval'
+}
+
+startup_claim_count() {
+  local claim_dir="$XDG_RUNTIME_DIR/omarchy-display-order.display-order"
+  local -a claims=()
+  shopt -s nullglob
+  claims=("$claim_dir"/startup-*.claim)
+  shopt -u nullglob
+  printf '%s\n' "${#claims[@]}"
 }
 
 assert_autoreload_state() {
@@ -532,5 +556,79 @@ run_ok --apply-saved
 [[ $LAST_OUTPUT == *'saved monitor is not currently eligible and will be skipped'* ]] || fail 'hotplug removal was not reported'
 [[ $LAST_OUTPUT == *'newly eligible monitor appended'* ]] || fail 'hotplug addition was not reported'
 pass 'hotplugged and disconnected monitors are handled without compositor state'
+
+new_case "$test_root/fixtures/two.json"
+run_ok --save-order B A
+cp -- "$test_root/fixtures/two-reversed.json" "$MOCK_APPLIED"
+export HYPRLAND_INSTANCE_SIGNATURE=session-one
+run_ok --startup-apply-saved
+cmp -s -- "$MOCK_STATE" "$MOCK_APPLIED" || fail 'first startup claim did not apply the saved order'
+[[ $(startup_claim_count) -eq 1 ]] || fail 'first startup did not create exactly one claim'
+: >"$MOCK_LOG"
+run_ok --startup-apply-saved
+assert_mock_log_empty
+[[ $(startup_claim_count) -eq 1 ]] || fail 'same startup signature created another claim'
+pass 'the same Hyprland signature applies startup order only once'
+
+cp -- "$MOCK_ORIGINAL" "$MOCK_STATE"
+cp -- "$test_root/fixtures/two-reversed.json" "$MOCK_APPLIED"
+rm -f -- "$MOCK_STATE.eval-count" "$MOCK_STATE.monitor-queries"
+: >"$MOCK_LOG"
+export HYPRLAND_INSTANCE_SIGNATURE=session-two
+run_ok --startup-apply-saved
+assert_mock_log_has_eval
+[[ $(startup_claim_count) -eq 2 ]] || fail 'new startup signature did not create a new claim'
+pass 'a new Hyprland signature can perform one startup apply'
+
+new_case "$test_root/fixtures/two.json"
+export HYPRLAND_INSTANCE_SIGNATURE=session-without-order
+run_ok --startup-apply-saved
+assert_mock_log_empty
+[[ $(startup_claim_count) -eq 1 ]] || fail 'startup without order did not record its claim'
+: >"$MOCK_LOG"
+run_ok --startup-apply-saved
+assert_mock_log_empty
+pass 'startup without order records a terminal claim without touching Hyprland'
+
+new_case "$test_root/fixtures/two.json"
+run_ok --save-order B A
+cp -- "$test_root/fixtures/two-reversed.json" "$MOCK_APPLIED"
+export HYPRLAND_INSTANCE_SIGNATURE=session-explicit
+run_ok --startup-apply-saved
+cp -- "$test_root/fixtures/two.json" "$MOCK_STATE"
+rm -f -- "$MOCK_STATE.eval-count" "$MOCK_STATE.monitor-queries"
+: >"$MOCK_LOG"
+run_ok --apply-saved
+assert_mock_log_has_eval
+pass 'explicit apply-saved remains repeatable after a startup claim'
+
+new_case "$test_root/fixtures/two.json"
+run_ok --save-order A B
+export HYPRLAND_INSTANCE_SIGNATURE=session-terminal
+export MOCK_FAIL_APPLY=1
+run_fail --startup-apply-saved
+[[ $(startup_claim_count) -eq 1 ]] || fail 'terminal startup failure did not remain claimed'
+export MOCK_FAIL_APPLY=0
+cp -- "$MOCK_ORIGINAL" "$MOCK_STATE"
+: >"$MOCK_LOG"
+run_ok --startup-apply-saved
+assert_mock_log_empty
+pass 'terminal startup failure is not reexecuted on hot reload'
+
+new_case "$test_root/fixtures/two.json"
+run_ok --save-order A B
+unset HYPRLAND_INSTANCE_SIGNATURE
+run_fail --startup-apply-saved
+assert_mock_log_empty
+[[ $(startup_claim_count) -eq 0 ]] || fail 'missing signature created a startup claim'
+pass 'missing startup signature fails before any Hyprland call'
+
+new_case "$test_root/fixtures/two.json"
+run_ok --save-order A B
+export HYPRLAND_INSTANCE_SIGNATURE='unsafe/signature'
+run_fail --startup-apply-saved
+assert_mock_log_empty
+[[ $(startup_claim_count) -eq 0 ]] || fail 'unsafe signature created a startup claim'
+pass 'unsafe startup signature fails before any Hyprland call'
 
 printf 'All reorder-displays tests passed.\n'
