@@ -216,33 +216,6 @@ apply_scale_layout() {
   fi
 }
 
-# Persist only Omarchy's existing global variable. disable_autoreload avoids
-# re-running its unchanged fallback (position = "auto") after the live batch.
-persist_global_scale() {
-  local scale=$1 monitor_lua temp_file previous_autoreload
-  monitor_lua="${HOME}/.config/hypr/monitors.lua"
-  [[ -f $monitor_lua ]] || fail "missing Omarchy monitor config: $monitor_lua"
-  grep -q '^local omarchy_monitor_scale = ' "$monitor_lua" || fail "Omarchy global scale variable is unavailable"
-
-  previous_autoreload=$(hyprctl -j getoption misc.disable_autoreload 2>/dev/null | jq -r '.bool')
-  [[ $previous_autoreload == true || $previous_autoreload == false ]] || fail 'could not read Hyprland auto-reload state'
-  hyprctl eval 'hl.config({ misc = { disable_autoreload = true } })' >/dev/null || fail 'could not pause Hyprland auto-reload'
-
-  temp_file=$(mktemp "${monitor_lua}.omarchy-display-order.XXXXXX") || {
-    hyprctl eval "hl.config({ misc = { disable_autoreload = $previous_autoreload } })" >/dev/null || true
-    fail 'could not create temporary monitor config'
-  }
-  if ! sed -E "s|^local omarchy_monitor_scale = .*|local omarchy_monitor_scale = ${scale}|" "$monitor_lua" >"$temp_file" \
-      || ! grep -q "^local omarchy_monitor_scale = ${scale}$" "$temp_file" \
-      || ! mv -f "$temp_file" "$monitor_lua"; then
-    rm -f "$temp_file"
-    hyprctl eval "hl.config({ misc = { disable_autoreload = $previous_autoreload } })" >/dev/null || true
-    fail 'could not atomically persist Omarchy global scale'
-  fi
-  hyprctl eval "hl.config({ misc = { disable_autoreload = $previous_autoreload } })" >/dev/null \
-    || fail 'could not restore Hyprland auto-reload state'
-}
-
 # hyprctl eval receives a dispatcher expression; execute the modern dispatcher
 # object explicitly. This is the same hl.dsp API used by the active bindings.
 workspace_move_lua() {
@@ -674,13 +647,14 @@ apply_prepared_plan() {
 }
 
 set_saved_scale() {
-  local preset=$1 actual_monitors focus active_window scale_monitor scale_width scale_height effective_scale
+  local preset=$1 actual_monitors focus active_window scale_monitor scale_name scale_width scale_height effective_scale
   local saved_current_order_text scale_snapshot
   local -a ordered=()
 
   validate_scale_preset "$preset"
   actual_monitors=$monitors_json
   scale_monitor=$(jq -ce '.[] | select(.focused == true)' <<<"$actual_monitors") || fail 'could not determine focused monitor for scale'
+  scale_name=$(jq -r '.name' <<<"$scale_monitor")
   scale_width=$(jq -r '.width' <<<"$scale_monitor")
   scale_height=$(jq -r '.height' <<<"$scale_monitor")
   effective_scale=$(clean_scale "$preset" "$scale_width" "$scale_height")
@@ -688,6 +662,7 @@ set_saved_scale() {
   saved_current_order_text=$(order_for_current_monitors) || exit $?
   mapfile -t ordered <<<"$saved_current_order_text"
   ((${#ordered[@]} > 0)) || fail 'saved order has no active monitors'
+  [[ " ${ordered[*]} " == *" $scale_name "* ]] || fail 'focused monitor is not currently eligible for scale'
 
   # Capture the real pre-change layout for rollback and focus preservation.
   scale_snapshot=$(jq -ce --args '[.[] | select(.name as $name | $ARGS.positional | index($name)) | {name, width, height, refreshRate, x, y, scale, transform, disabled:(.disabled // false), mirrorOf:(.mirrorOf // "none")}]' "${ordered[@]}" <<<"$actual_monitors") || fail 'could not capture scale rollback state'
@@ -697,32 +672,55 @@ set_saved_scale() {
     | { focusedMonitor: ($focused.name // null), activeWindowAddress: ($active.address // null) }
   ' <<<"$actual_monitors") || fail 'could not capture focus before scale'
 
-  # Reuse the existing logical-width calculation, but substitute the new
-  # global scale before planning. Its numeric x values are verification facts;
-  # the live batch below intentionally uses 0x0 + auto-right instead.
-  monitors_json=$(jq -ce --argjson scale "$effective_scale" --args '
-    ($ARGS.positional) as $ordered
-    | map(if (.name as $name | $ordered | index($name)) then .scale = $scale else . end)
-  ' "${ordered[@]}" <<<"$actual_monitors") || fail 'could not prepare scale layout'
+  # Reuse the existing logical-width calculation, changing only the focused
+  # monitor. Every other monitor keeps the scale read from Hyprland; its
+  # numeric x values are verification facts, while the live batch below uses
+  # 0x0 + auto-right instead.
+  monitors_json=$(jq -ce --arg name "$scale_name" --argjson scale "$effective_scale" '
+    map(if .name == $name then .scale = $scale else .scale = .scale end)
+  ' <<<"$actual_monitors") || fail 'could not prepare scale layout'
   prepare_plan "${ordered[@]}"
   plan=$(jq -ce --argjson base "$base_x" 'map(.x = (.x - $base) | .y = 0)' <<<"$plan") || fail 'could not normalize scale layout origin'
 
+  # Scale persistence is one transaction with the live change. The managed
+  # block is generated from the individual scales in monitors_json; the
+  # existing Omarchy global variable is deliberately never modified.
+  snapshot=$scale_snapshot
+  capture_transaction_state
+  capture_autoreload_state
+  transaction_active=true
   save_snapshot "$scale_snapshot"
   printf 'Applying scale and saved display order...\n'
   if ! apply_scale_layout "$plan" "$focused_state"; then
     printf 'reorder-displays: scale/layout command failed; attempting automatic restore\n' >&2
-    restore_snapshot "$scale_snapshot" || true
+    rollback_transaction || true
     return 1
   fi
   if ! verify_layout "$plan"; then
     printf 'reorder-displays: scale/layout verification failed; attempting automatic restore\n' >&2
-    restore_snapshot "$scale_snapshot" || true
+    rollback_transaction || true
     return 1
   fi
 
-  persist_global_scale "$effective_scale"
+  transaction_sync_started=true
+  if !(sync_config_preserving_inactive); then
+    printf 'reorder-displays: monitor config sync failed after scale apply; attempting rollback\n' >&2
+    rollback_transaction || true
+    return 1
+  fi
   if ! verify_layout "$plan"; then
-    fail 'Hyprland layout changed while persisting global scale'
+    printf 'reorder-displays: Hyprland layout changed while persisting individual scale; attempting rollback\n' >&2
+    rollback_transaction || true
+    return 1
+  fi
+  # Config and live state are now committed. Keep autoreload disabled until
+  # this point so every failure path above can restore both while no reload
+  # can race the rollback. Restoring the original flag is post-commit; the
+  # EXIT cleanup retries it if this final API call is interrupted.
+  transaction_committed=true
+  if ! restore_autoreload_state; then
+    printf 'reorder-displays: could not restore Hyprland auto-reload state after scale sync\n' >&2
+    return 1
   fi
   printf 'Scale and saved display order applied.\n'
 }
@@ -752,36 +750,114 @@ config_order_for_active_monitors() {
   done < <(jq -r '.[]' <<<"$saved_json")
 }
 
+generate_config_rule() {
+  local name=$1 index=$2 monitor scale transform
+  monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json") || return 1
+  scale=$(jq -r '.scale' <<<"$monitor")
+  jq -e '.scale | type == "number" and . > 0' <<<"$monitor" >/dev/null || fail "invalid scale for: $name"
+  transform=$(jq -r '.transform' <<<"$monitor")
+  jq -e '.transform | type == "number"' <<<"$monitor" >/dev/null || fail "invalid transform for: $name"
+  printf 'hl.monitor({\n'
+  printf '    output = %s,\n' "$(jq -Rn --arg value "$name" '$value')"
+  printf '    mode = "preferred",\n'
+  if ((index == 0)); then
+    printf '    position = "0x0",\n'
+  else
+    printf '    position = "auto-right",\n'
+  fi
+  printf '    scale = %s' "$scale"
+  # Omitted transform follows the native generic rule. A non-zero current
+  # transform must be explicit so the specific rule cannot clear rotation.
+  if [[ $transform != 0 ]]; then
+    printf ',\n    transform = %s\n' "$transform"
+  else
+    printf '\n'
+  fi
+  printf '})\n'
+}
+
 generate_config_block() {
-  local order_text name monitor transform index=0
+  local order_text name last_name index=0
   order_text=$(config_order_for_active_monitors) || return 1
   [[ -n $order_text ]] || fail 'no saved monitors are currently eligible for a config block'
+  last_name=$(printf '%s\n' "$order_text" | tail -n 1)
 
   printf '%s\n' "$config_begin_marker"
   while IFS= read -r name; do
-    monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json") || return 1
-    transform=$(jq -r '.transform' <<<"$monitor")
-    jq -e '.transform | type == "number"' <<<"$monitor" >/dev/null || fail "invalid transform for: $name"
-    printf 'hl.monitor({\n'
-    printf '    output = %s,\n' "$(jq -Rn --arg value "$name" '$value')"
-    printf '    mode = "preferred",\n'
-    if ((index == 0)); then
-      printf '    position = "0x0",\n'
-    else
-      printf '    position = "auto-right",\n'
-    fi
-    printf '    scale = omarchy_monitor_scale'
-    # Omitted transform follows the native generic rule. A non-zero current
-    # transform must be explicit so the specific rule cannot clear rotation.
-    if [[ $transform != 0 ]]; then
-      printf ',\n    transform = %s\n' "$transform"
-    else
-      printf '\n'
-    fi
-    printf '})\n'
+    generate_config_rule "$name" "$index" || return 1
     index=$((index + 1))
-    [[ $name == "$(printf '%s\n' "$order_text" | tail -n 1)" ]] || printf '\n'
+    [[ $name == "$last_name" ]] || printf '\n'
   done <<<"$order_text"
+  printf '%s\n' "$config_end_marker"
+}
+
+# Return a complete generated rule from the existing managed block. This is
+# used only by scale persistence so a temporarily absent monitor is not
+# discarded while the live layout is recalculated for the connected ones.
+managed_rule_for_monitor() {
+  local config=$1 name=$2 output_line
+  [[ -f $config ]] || return 0
+  output_line="    output = $(jq -Rn --arg value "$name" '$value'),"
+  awk -v begin="$config_begin_marker" -v end="$config_end_marker" -v output="$output_line" '
+    $0 == begin { inside = 1; in_rule = 0; rule = ""; found = 0; next }
+    $0 == end { inside = 0; in_rule = 0; next }
+    inside && $0 == "hl.monitor({" { in_rule = 1; rule = $0; found = 0; next }
+    inside && in_rule {
+      rule = rule "\n" $0
+      if ($0 == output) found = 1
+      if ($0 == "})") {
+        if (found) { print rule; exit }
+        in_rule = 0
+      }
+    }
+  ' "$config"
+}
+
+normalize_preserved_rule() {
+  local config=$1 rule=$2 global_scale
+  if [[ $rule == *'scale = omarchy_monitor_scale'* ]]; then
+    global_scale=$(awk -F'= ' '/^local omarchy_monitor_scale = / { print $2; exit }' "$config")
+    [[ $global_scale =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    rule=$(printf '%s\n' "$rule" | awk -v scale="$global_scale" '
+      { if ($0 ~ /^    scale = omarchy_monitor_scale(,)?$/) sub(/omarchy_monitor_scale/, scale); print }
+    ')
+  fi
+  [[ $rule != *'omarchy_monitor_scale'* ]] || return 1
+  printf '%s\n' "$rule"
+}
+
+generate_config_block_preserving_inactive() {
+  local config=$1 saved_json name monitor disabled mirror_of old_rule preserved_rule
+  local saved_index=0 emitted=0
+  saved_json=$(read_saved_order) || return 1
+
+  printf '%s\n' "$config_begin_marker"
+  while IFS= read -r name; do
+    if monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json"); then
+      disabled=$(jq -r '.disabled // false' <<<"$monitor")
+      mirror_of=$(jq -r '.mirrorOf // "none"' <<<"$monitor")
+    else
+      disabled=true
+      mirror_of=none
+    fi
+
+    if [[ $disabled != true && ( $mirror_of == none || -z $mirror_of ) ]]; then
+      ((emitted > 0)) && printf '\n'
+      generate_config_rule "$name" "$saved_index" || return 1
+      emitted=$((emitted + 1))
+    else
+      old_rule=$(managed_rule_for_monitor "$config" "$name")
+      if [[ -n $old_rule ]]; then
+        preserved_rule=$(normalize_preserved_rule "$config" "$old_rule") || fail "invalid preserved monitor rule for: $name"
+        ((emitted > 0)) && printf '\n'
+        printf '%s\n' "$preserved_rule"
+        emitted=$((emitted + 1))
+      fi
+    fi
+    saved_index=$((saved_index + 1))
+  done < <(jq -r '.[]' <<<"$saved_json")
+
+  ((emitted > 0)) || fail 'no saved monitors are currently eligible for a config block'
   printf '%s\n' "$config_end_marker"
 }
 
@@ -845,6 +921,13 @@ sync_config() {
   local config block
   config=$(monitor_config_file)
   block=$(generate_config_block) || return 1
+  write_config_atomically "$config" "$block" replace
+}
+
+sync_config_preserving_inactive() {
+  local config block
+  config=$(monitor_config_file)
+  block=$(generate_config_block_preserving_inactive "$config") || return 1
   write_config_atomically "$config" "$block" replace
 }
 

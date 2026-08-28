@@ -147,6 +147,16 @@ JSON
 JSON
 }
 
+set_individual_scale_fixture() {
+  local dir=$1
+  cat >"$dir/two-individual-scales.json" <<'JSON'
+[
+  {"name":"A","width":1000,"height":800,"refreshRate":60,"x":0,"y":0,"scale":1,"transform":0,"focused":true,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":1}},
+  {"name":"B","width":1000,"height":800,"refreshRate":60,"x":1000,"y":0,"scale":1.5,"transform":0,"focused":false,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":2}}
+]
+JSON
+}
+
 set_3_monitor_fixture() {
   local dir=$1
   cat >"$dir/three.json" <<'JSON'
@@ -277,6 +287,7 @@ assert_no_transaction_temps() {
 make_mocks
 mkdir -p "$test_root/fixtures"
 set_2_monitor_fixture "$test_root/fixtures"
+set_individual_scale_fixture "$test_root/fixtures"
 set_3_monitor_fixture "$test_root/fixtures"
 set_disabled_mirrored_fixture "$test_root/fixtures"
 
@@ -496,6 +507,76 @@ assert_order '["A","B"]'
 cmp -s -- "$MOCK_STATE" "$MOCK_ORIGINAL" || fail 'sync failure did not restore live state'
 assert_no_transaction_temps
 pass 'config sync failure rolls back order, config, and live state'
+
+new_case "$test_root/fixtures/two-individual-scales.json"
+run_ok --save-order A B
+cat >"$test_root/fixtures/two-individual-scales-applied.json" <<'JSON'
+[
+  {"name":"A","width":1000,"height":800,"refreshRate":60,"x":0,"y":0,"scale":2,"transform":0,"focused":true,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":1}},
+  {"name":"B","width":1000,"height":800,"refreshRate":60,"x":500,"y":0,"scale":1.5,"transform":0,"focused":false,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":2}}
+]
+JSON
+cp -- "$test_root/fixtures/two-individual-scales-applied.json" "$MOCK_APPLIED"
+run_ok --set-scale 2
+cmp -s -- "$MOCK_STATE" "$MOCK_APPLIED" || fail 'scale change did not preserve the other monitor scale'
+grep -Fxq 'local omarchy_monitor_scale = 1' "$HOME/.config/hypr/monitors.lua" || fail 'individual scale change modified the global scale variable'
+[[ $(<"$HOME/.config/hypr/monitors.lua") == *$'    scale = 2'* ]] || fail 'managed config did not persist the focused monitor scale'
+[[ $(<"$HOME/.config/hypr/monitors.lua") == *$'    scale = 1.5'* ]] || fail 'managed config did not persist the other monitor scale'
+managed_config=$(awk '/^-- BEGIN omarchy-display-order.display-order managed order$/{inside=1} inside{print} /^-- END omarchy-display-order.display-order managed order$/{inside=0}' "$HOME/.config/hypr/monitors.lua")
+[[ $managed_config != *omarchy_monitor_scale* ]] || fail 'managed config still references the global scale variable'
+pass 'set-scale changes only the focused scale and persists individual managed scales'
+
+new_case "$test_root/fixtures/two-individual-scales.json"
+run_ok --save-order A B
+original_config=$(<"$HOME/.config/hypr/monitors.lua")
+cp -- "$test_root/fixtures/two-individual-scales-applied.json" "$MOCK_APPLIED"
+export MOCK_LUAC_FAIL=1
+run_fail --set-scale 2
+[[ $LAST_OUTPUT == *'monitor config sync failed after scale apply'* ]] || fail 'scale config failure was not reported'
+cmp -s -- "$MOCK_STATE" "$MOCK_ORIGINAL" || fail 'scale config failure did not restore live state'
+[[ $(<"$HOME/.config/hypr/monitors.lua") == "$original_config" ]] || fail 'scale config failure changed monitors.lua'
+rollback_monitor_line=$(awk '/^eval hl\.monitor/{count++; if (count == 2) {print NR; exit}}' "$MOCK_LOG")
+autoreload_restore_line=$(awk '/disable_autoreload = false/{print NR; exit}' "$MOCK_LOG")
+[[ -n $rollback_monitor_line && -n $autoreload_restore_line && $rollback_monitor_line -lt $autoreload_restore_line ]] || fail 'autoreload was restored before scale rollback completed'
+assert_no_transaction_temps
+pass 'individual scale persistence failure rolls back live state and config'
+
+new_case "$test_root/fixtures/two-individual-scales.json"
+run_ok --save-order A B
+run_ok --sync-config
+cat >"$test_root/fixtures/only-a.json" <<'JSON'
+[
+  {"name":"A","width":1000,"height":800,"refreshRate":60,"x":0,"y":0,"scale":1,"transform":0,"focused":true,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":1}}
+]
+JSON
+cp -- "$test_root/fixtures/only-a.json" "$MOCK_STATE"
+cp -- "$test_root/fixtures/only-a.json" "$MOCK_ORIGINAL"
+cp -- "$test_root/fixtures/only-a.json" "$MOCK_APPLIED"
+rm -f -- "$MOCK_STATE.eval-count" "$MOCK_STATE.monitor-queries"
+: >"$MOCK_LOG"
+cat >"$test_root/fixtures/only-a-applied.json" <<'JSON'
+[
+  {"name":"A","width":1000,"height":800,"refreshRate":60,"x":0,"y":0,"scale":2,"transform":0,"focused":true,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":1}}
+]
+JSON
+cp -- "$test_root/fixtures/only-a-applied.json" "$MOCK_APPLIED"
+run_ok --set-scale 2
+managed_config=$(awk '/^-- BEGIN omarchy-display-order.display-order managed order$/{inside=1} inside{print} /^-- END omarchy-display-order.display-order managed order$/{inside=0}' "$HOME/.config/hypr/monitors.lua")
+[[ $managed_config == *$'    output = "B",'* ]] || fail 'scale change discarded the disconnected monitor rule'
+[[ $managed_config == *$'    scale = 1.5'* ]] || fail 'scale change discarded the disconnected monitor scale'
+cat >"$test_root/fixtures/two-individual-scales-reconnected.json" <<'JSON'
+[
+  {"name":"A","width":1000,"height":800,"refreshRate":60,"x":0,"y":0,"scale":2,"transform":0,"focused":true,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":1}},
+  {"name":"B","width":1000,"height":800,"refreshRate":60,"x":500,"y":0,"scale":1.5,"transform":0,"focused":false,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":2}}
+]
+JSON
+cp -- "$test_root/fixtures/two-individual-scales-reconnected.json" "$MOCK_STATE"
+rm -f -- "$MOCK_STATE.monitor-queries"
+: >"$MOCK_LOG"
+run_ok --sync-config
+managed_config=$(awk '/^-- BEGIN omarchy-display-order.display-order managed order$/{inside=1} inside{print} /^-- END omarchy-display-order.display-order managed order$/{inside=0}' "$HOME/.config/hypr/monitors.lua")
+[[ $managed_config == *$'    output = "B",'* && $managed_config == *$'    scale = 1.5'* ]] || fail 'reconnected monitor did not retain its individual scale'
+pass 'scale changes preserve disconnected managed rules through reconnection'
 
 new_case "$test_root/fixtures/two.json"
 run_ok --save-order A B
