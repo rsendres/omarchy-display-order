@@ -73,6 +73,7 @@ exit, and is disabled during drag-and-drop. It uses the Hyprland output name
 - `order.json` is the source of the preferred monitor order.
 - Hyprland receives a layout with `0x0` for the first monitor and `auto-right` for each following monitor.
 - Logical widths account for each monitor's scale and rotation.
+- Scale presets are reduced to the nearest mode-valid `1/120` unit. The UI presents the effective value to two decimal places, while the generated monitor configuration preserves six significant digits.
 - A managed block in `monitors.lua` makes reloads safe.
 - `Service.qml` restores the saved display order/layout during startup. The plugin neither imposes workspace numbers nor creates or permanently manages workspaces.
 
@@ -83,6 +84,8 @@ If the managed monitor block should be removed before uninstalling, run:
 ```bash
 scripts/reorder-displays --remove-config-block
 ```
+
+When the plugin rewrites `~/.config/hypr/monitors.lua`, it keeps the five newest plugin-owned timestamped backups alongside the file. Backups created by other tools are not managed.
 
 Then remove the plugin through Omarchy:
 
@@ -101,6 +104,7 @@ Run these checks from the plugin root:
 ```bash
 bash -n scripts/reorder-displays
 tests/test_reorder_displays.sh
+tests/test_scale_normalization.sh
 luac -p "$HOME/.config/hypr/monitors.lua"
 git diff --check
 omarchy plugin validate .

@@ -867,6 +867,12 @@ assert_order '["B","A"]'
 pass 'advisory lock serializes callers, preserves its pathname, and releases the FD'
 
 new_case "$test_root/fixtures/two.json"
+set_applied_fixture "$test_root/fixtures/two-reversed.json"
+run_ok --apply-and-save B A
+[[ $(<"$MOCK_STATE.eval-count") -eq 1 ]] || fail 'successful apply did not issue exactly one monitor eval'
+pass 'successful apply issues one monitor mutation'
+
+new_case "$test_root/fixtures/two.json"
 original_config=$(<"$HOME/.config/hypr/monitors.lua")
 export MOCK_FAIL_APPLY=1
 run_fail --apply-and-save B A
@@ -875,8 +881,18 @@ run_fail --apply-and-save B A
 cmp -s -- "$MOCK_STATE" "$MOCK_ORIGINAL" || fail 'apply failure did not restore live state'
 [[ ! -e "$XDG_STATE_HOME/omarchy/omarchy-display-order.display-order/order.json" ]] || fail 'apply failure wrote order.json'
 [[ $(<"$HOME/.config/hypr/monitors.lua") == "$original_config" ]] || fail 'apply failure changed monitors.lua'
+[[ $(<"$MOCK_STATE.eval-count") -eq 2 ]] || fail 'successful immediate restore was duplicated by transaction rollback'
 assert_no_transaction_temps
-pass 'live apply failure restores the snapshot and cleans transaction files'
+pass 'failed apply with successful immediate restore restores exactly once'
+
+new_case "$test_root/fixtures/two.json"
+original_config=$(<"$HOME/.config/hypr/monitors.lua")
+export MOCK_FAIL_APPLY=1 MOCK_FAIL_RESTORE=1
+run_fail --apply-and-save B A
+[[ $(<"$MOCK_STATE.eval-count") -eq 3 ]] || fail 'failed immediate restore did not trigger a second rollback attempt'
+[[ $(<"$HOME/.config/hypr/monitors.lua") == "$original_config" ]] || fail 'failed restore changed monitors.lua'
+assert_no_transaction_temps
+pass 'failed apply with failed immediate restore retries live restoration'
 
 new_case "$test_root/fixtures/two.json"
 run_ok --save-order A B
@@ -1150,5 +1166,33 @@ run_fail --startup-apply-saved
 assert_mock_log_empty
 [[ $(startup_claim_count) -eq 0 ]] || fail 'unsafe signature created a startup claim'
 pass 'unsafe startup signature fails before any Hyprland call'
+
+new_case "$test_root/fixtures/two.json"
+run_ok --save-order A B
+backup_dir="$HOME/.config/hypr"
+old_backups=(
+  '20000101-000000-000000001'
+  '20000101-000000-000000002'
+  '20000101-000000-000000003'
+  '20000101-000000-000000004'
+  '20000101-000000-000000005'
+  '20000101-000000-000000006'
+  '20000101-000000-000000007'
+)
+for suffix in "${old_backups[@]}"; do
+  printf 'old backup %s\n' "$suffix" >"$backup_dir/monitors.lua.omarchy-display-order.bak.$suffix"
+done
+printf 'keep this file\n' >"$backup_dir/monitors.lua.omarchy-display-order.bak.not-a-timestamp"
+printf 'keep this file too\n' >"$backup_dir/monitors.lua.user-backup"
+run_ok --sync-config
+for suffix in "${old_backups[@]:0:3}"; do
+  [[ ! -e "$backup_dir/monitors.lua.omarchy-display-order.bak.$suffix" ]] || fail "old backup was retained: $suffix"
+done
+for suffix in "${old_backups[@]:3}"; do
+  [[ -f "$backup_dir/monitors.lua.omarchy-display-order.bak.$suffix" ]] || fail "newest backup was removed: $suffix"
+done
+[[ -f "$backup_dir/monitors.lua.omarchy-display-order.bak.not-a-timestamp" ]] || fail 'non-plugin backup was removed'
+[[ -f "$backup_dir/monitors.lua.user-backup" ]] || fail 'unrelated backup was removed'
+pass 'config backup retention keeps the newest five and preserves non-plugin files'
 
 printf 'All reorder-displays tests passed.\n'

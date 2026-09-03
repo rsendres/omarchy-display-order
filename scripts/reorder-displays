@@ -26,6 +26,7 @@ transaction_active=false
 transaction_committed=false
 transaction_rollback_done=false
 live_layout_attempted=false
+live_layout_restored=false
 change_id_journal_file="$runtime_dir/reorder-displays-change-id.json"
 change_id_journal_active=false
 base_normalization=false
@@ -40,6 +41,7 @@ change_id_targets_json='[]'
 startup_mode=false
 startup_claim_existing=false
 startup_claim_file=''
+config_backup_retention=5
 
 usage() {
   printf 'Usage:\n  %s --dry-run MONITOR [MONITOR ...]\n  %s --apply-live MONITOR [MONITOR ...]\n  %s --save-order MONITOR [MONITOR ...]\n  %s --apply-and-save MONITOR [MONITOR ...]\n  %s --startup-apply-saved\n  %s --apply-saved\n  %s --set-scale PRESET\n  %s --print-config-block\n  %s --sync-config\n  %s --remove-config-block\n  %s --restore-last\n' "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" >&2
@@ -175,14 +177,18 @@ monitor_lua() {
     ", scale = " + (.scale | tostring) +
     ", transform = " + (.transform | tostring) + " })"'
 }
-apply_layout() {
-  local lua output
-  lua=$(monitor_lua <<<"$1") || return 1
-  [[ -n $lua ]] || return 1
+eval_lua() {
+  local lua=$1 output
   if ! output=$(hyprctl eval "$lua" 2>&1); then
     printf '%s\n' "$output" >&2
     return 1
   fi
+}
+apply_layout() {
+  local lua
+  lua=$(monitor_lua <<<"$1") || return 1
+  [[ -n $lua ]] || return 1
+  eval_lua "$lua"
 }
 
 # Interactive geometry changes briefly tag the clients that were on the
@@ -190,7 +196,7 @@ apply_layout() {
 # timer live in the same eval as the monitor mutations, so a failed monitor
 # call cannot strand the temporary tags or rule.
 apply_interactive_reorder_layout() {
-  local geometry_lua lua target_lua cleanup_lua output
+  local geometry_lua lua target_lua cleanup_lua
   geometry_lua=$(monitor_lua <<<"$1") || return 1
   [[ -n $geometry_lua ]] || return 1
   target_lua=$(jq -r --arg tag "$reorder_suppression_tag" '
@@ -222,15 +228,15 @@ apply_interactive_reorder_layout() {
     'displayOrderNoAnimationRule:set_enabled(true)' \
     "$geometry_lua") || return 1
 
-  if ! output=$(hyprctl eval "$lua" 2>&1); then
-    printf '%s\n' "$output" >&2
-    return 1
-  fi
+  eval_lua "$lua"
 }
 
-# This is intentionally the same clean-scale rule as
-# omarchy-hyprland-monitor-scaling. The UI's 1.6 preset therefore becomes the
-# mode-valid 1.66667 scale on a 1600x900 output.
+# For supported positive presets and ordinary integer mode dimensions, this
+# uses the same nearest 1/120-unit clean-scale reduction as Model.js. Keep the
+# shell's six-significant-digit formatting: the UI's normalizeScale
+# intentionally presents the same effective value to two decimal places. The
+# UI's 1.6 preset therefore becomes the mode-valid 1.66667 scale on a 1600x900
+# output here (and 1.67 in the UI).
 clean_scale() {
   awk -v scale="$1" -v width="$2" -v height="$3" '
     function gcd(a, b, t) { while (b) { t = a % b; a = b; b = t } return a }
@@ -259,13 +265,10 @@ monitor_auto_right_lua() {
 }
 
 apply_scale_layout() {
-  local expected=$1 lua output
+  local expected=$1 lua
   lua=$(monitor_auto_right_lua <<<"$expected") || return 1
   [[ -n $lua ]] || return 1
-  if ! output=$(hyprctl eval "$lua" 2>&1); then
-    printf '%s\n' "$output" >&2
-    return 1
-  fi
+  eval_lua "$lua"
 }
 
 eligible_slots() {
@@ -742,7 +745,7 @@ rollback_transaction() {
       clear_change_id_journal || rollback_failed=true
     fi
   fi
-  if [[ $live_layout_attempted == true ]]; then
+  if [[ $live_layout_attempted == true && $live_layout_restored != true ]]; then
     if ! restore_snapshot "$snapshot"; then
       printf 'reorder-displays: rollback failed: could not restore the live display snapshot\n' >&2
       rollback_failed=true
@@ -899,7 +902,9 @@ apply_prepared_plan() {
   fi
   if ! "$apply_command" "$plan"; then
     printf 'reorder-displays: live apply failed; attempting automatic restore\n' >&2
-    if ! restore_snapshot "$snapshot"; then
+    if restore_snapshot "$snapshot"; then
+      live_layout_restored=true
+    else
       printf 'reorder-displays: rollback failed after live apply failure\n' >&2
     fi
     [[ $transaction_active == true ]] || transaction_rollback_done=true
@@ -907,7 +912,9 @@ apply_prepared_plan() {
   fi
   if ! verify_layout "$plan"; then
     printf 'reorder-displays: live layout verification failed; no workspace dispatch issued; attempting automatic restore\n' >&2
-    if ! restore_snapshot "$snapshot"; then
+    if restore_snapshot "$snapshot"; then
+      live_layout_restored=true
+    else
       printf 'reorder-displays: rollback failed after live verification failure\n' >&2
     fi
     [[ $transaction_active == true ]] || transaction_rollback_done=true
@@ -1184,6 +1191,19 @@ managed_block_counts_are_valid() {
   [[ $begin_count -eq 0 && $end_count -eq 0 ]] || [[ $begin_count -eq 1 && $end_count -eq 1 ]]
 }
 
+retain_config_backups() {
+  local config=$1 backup
+  local -a backups=()
+  shopt -s nullglob
+  backups=("${config}".omarchy-display-order.bak.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+  shopt -u nullglob
+  ((${#backups[@]} > config_backup_retention)) || return 0
+  for backup in "${backups[@]:0:${#backups[@]}-config_backup_retention}"; do
+    [[ -f $backup ]] || continue
+    rm -f -- "$backup" 2>/dev/null || true
+  done
+}
+
 write_config_atomically() {
   local config=$1 replacement=$2 operation=$3 original_hash current_hash temp_file backup timestamp
   [[ -f $config ]] || fail "missing Hyprland monitor config: $config"
@@ -1230,6 +1250,7 @@ write_config_atomically() {
   [[ $current_hash == "$original_hash" ]] || { rm -f "$temp_file" "$backup"; fail 'monitors.lua changed before replacement'; }
   chmod --reference="$config" "$temp_file" || { rm -f "$temp_file" "$backup"; fail 'could not preserve monitors.lua permissions'; }
   mv -f -- "$temp_file" "$config" || { rm -f "$temp_file" "$backup"; fail 'could not atomically replace monitors.lua'; }
+  retain_config_backups "$config"
   printf 'Updated %s (backup: %s).\n' "$config" "$backup"
 }
 

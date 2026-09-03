@@ -5,6 +5,9 @@ function clampBrightness(value) {
 }
 
 function normalizeScale(scale) {
+  // This is presentation/matching normalization, not mode-unit reduction.
+  // Keep the UI's two-decimal representation stable; cleanScale below first
+  // reduces to the nearest mode-valid 1/120 unit.
   var n = parseFloat(String(scale || ""))
   if (!isFinite(n)) return ""
   return String(Math.round(n * 100) / 100)
@@ -26,6 +29,10 @@ function cleanScale(scale, width, height) {
   if (!isFinite(requested) || !isFinite(modeWidth) || !isFinite(modeHeight)
       || requested <= 0 || modeWidth <= 0 || modeHeight <= 0) return ""
 
+  // For supported positive presets and ordinary integer mode dimensions, this
+  // nearest 1/120-unit reduction matches the shell helper. The shell preserves
+  // the resulting value to six significant digits, while normalizeScale
+  // intentionally formats it for the UI to two decimals.
   var divisor = gcd(Math.round(modeWidth * 120), Math.round(modeHeight * 120))
   var scaleUnits = Math.round(requested * 120)
   if (scaleUnits > divisor) scaleUnits = divisor
