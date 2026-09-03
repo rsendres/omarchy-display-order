@@ -21,7 +21,6 @@ transaction_config_existed=false
 transaction_sync_started=false
 transaction_autoreload_state=''
 transaction_autoreload_captured=false
-transaction_autoreload_restore_attempted=false
 transaction_autoreload_restored=false
 transaction_active=false
 transaction_committed=false
@@ -38,7 +37,6 @@ before_client_outputs_json='[]'
 reorder_suppression_tag='omarchy_display_order_reorder'
 reorder_suppression_rule='omarchy_display_order_no_animation'
 change_id_targets_json='[]'
-change_id_temporary_id=0
 startup_mode=false
 startup_claim_existing=false
 startup_claim_file=''
@@ -389,7 +387,6 @@ special_blocks_normalization() {
 capture_reorder_state() {
   local requested=$1 active_window_json clients_json focused_monitor
   before_outputs_json=$(eligible_slots "$monitors_json") || fail 'could not capture monitor workspace slots'
-  reorder_workspace_json=$(hyprctl -j workspaces) || fail 'could not capture workspaces before reorder'
   clients_json=$(hyprctl -j clients) || fail 'could not capture clients before reorder'
   before_client_outputs_json=$(client_output_map "$monitors_json" "$clients_json") \
     || fail 'could not map clients to physical outputs before reorder'
@@ -539,7 +536,6 @@ preserve_reorder_workspaces() {
   workspaces=$(hyprctl -j workspaces) || return 1
   temp=$(find_free_workspace_id "$workspaces") || return 1
   change_id_targets_json=$(jq -cn --argjson requested "$requested" '$requested | to_entries | map({output:.value,id:(.key + 1)})')
-  change_id_temporary_id=$temp
   journal=$(jq -cn --argjson original "$before_outputs_json" --argjson targets "$change_id_targets_json" --argjson temp "$temp" '{operation:"change-id",original:($original | map({output,id:.activeWorkspace.id})),targets:$targets,temporary:$temp}')
   write_change_id_journal "$journal" || return 1
   lua=$(change_id_lua "$(change_id_plan "$current_slots" "$change_id_targets_json" "$temp")") || return 1
@@ -625,7 +621,6 @@ restore_autoreload_state() {
   fi
   # A failed API call is retryable from rollback/cleanup. Only a successful
   # call may mark the original value as restored.
-  transaction_autoreload_restore_attempted=true
   if ! hyprctl eval "hl.config({ misc = { disable_autoreload = $transaction_autoreload_state } })" >/dev/null; then
     return 1
   fi
@@ -1304,13 +1299,13 @@ if [[ $mode == --restore-last ]]; then
   exit 0
 fi
 
-# Query exactly once, immediately before calculation. Neither the UI nor the
-# saved state can supply stale geometry to Hyprland.
-monitors_json=$(query_monitors_for_mode) || fail 'could not query Hyprland monitors'
 if [[ $mode == --apply-live || $mode == --apply-saved || $mode == --apply-and-save ]]; then
   recover_change_id_journal
-  monitors_json=$(hyprctl -j monitors all) || fail 'could not query Hyprland monitors after journal recovery'
 fi
+# Query exactly once, immediately before calculation and after any journal
+# recovery. Neither the UI nor the saved state can supply stale geometry to
+# Hyprland; startup mode retains its retry behavior through this helper.
+monitors_json=$(query_monitors_for_mode) || fail 'could not query Hyprland monitors'
 if [[ $mode == --print-config-block ]]; then
   generate_config_block
   exit 0

@@ -26,11 +26,7 @@ Panel {
   property bool displayReorderApplying: false
   property bool displayDragActive: false
   property var displaysBeforeLiveReorder: []
-  // The order submitted for a drop is a snapshot.  It must not be rebuilt from
-  // root.displays while the compositor/helper is changing state.
-  property var pendingDisplayOrder: []
   property string displayReorderError: ""
-  property int scaleGeneration: 0
   property string queuedScale: ""
   property bool actionIsScale: false
   readonly property bool actionProcessRunning: actionProc.running
@@ -491,14 +487,14 @@ Panel {
     }
 
     displaysBeforeLiveReorder = root.displays.slice()
-    root.pendingDisplayOrder = eligible.map(function(display) {
+    var pendingDisplayOrder = eligible.map(function(display) {
       return String(display.name)
     })
     root.cancelMonitorIdentify()
     displayReorderError = ""
     displayReorderApplying = true
     root.displays = reordered
-    reorderProc.command = [reorderDisplaysHelper, "--apply-and-save"].concat(root.pendingDisplayOrder)
+    reorderProc.command = [reorderDisplaysHelper, "--apply-and-save"].concat(pendingDisplayOrder)
     reorderProc.running = true
   }
 
@@ -517,17 +513,15 @@ Panel {
   function setScale(scale) {
     if (root.displayReorderApplying || root.displayDragActive) return
     root.cancelMonitorIdentify()
-    root.scaleGeneration += 1
     if (actionProc.running) {
       // A running CLI cannot be changed in place. Keep only the newest click;
-      // its generation makes any earlier scale result obsolete.
       root.queuedScale = String(scale)
       return
     }
-    root.startScaleChange(String(scale), root.scaleGeneration)
+    root.startScaleChange(String(scale))
   }
 
-  function startScaleChange(scale, generation) {
+  function startScaleChange(scale) {
     root.actionIsScale = true
     actionProc.command = [root.reorderDisplaysHelper, "--set-scale", scale]
     actionProc.running = true
@@ -709,7 +703,7 @@ Panel {
       if (root.queuedScale !== "") {
         var nextScale = root.queuedScale
         root.queuedScale = ""
-        root.startScaleChange(nextScale, root.scaleGeneration)
+        root.startScaleChange(nextScale)
         return
       }
       if (!root.actionIsScale) {

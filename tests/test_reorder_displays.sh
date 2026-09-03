@@ -38,12 +38,12 @@ apply_monitor_layout() {
 }
 
 if [[ ${1:-} == -j && ${2:-} == monitors ]]; then
-  if [[ ${MOCK_PRE_LAYOUT_REVALIDATION:-0} == 1 || ${MOCK_TOPOLOGY_CHANGE:-0} == 1 || ${MOCK_TOPOLOGY_CHANGE_BEFORE_WORKSPACE:-0} == 1 || ${MOCK_FINAL_WORKSPACE_VERIFY:-0} == 1 || ${MOCK_POST_SYNC_LAYOUT:-0} == 1 ]]; then
+  if [[ ${MOCK_PRE_LAYOUT_REVALIDATION:-0} == 1 || ${MOCK_TOPOLOGY_CHANGE:-0} == 1 || ${MOCK_TOPOLOGY_CHANGE_BEFORE_WORKSPACE:-0} == 1 || ${MOCK_POST_SYNC_LAYOUT:-0} == 1 ]]; then
     query_count=0
     [[ -r ${MOCK_STATE}.monitor-queries ]] && query_count=$(<"${MOCK_STATE}.monitor-queries")
     query_count=$((query_count + 1))
     printf '%s\n' "$query_count" >"${MOCK_STATE}.monitor-queries"
-    if [[ ${MOCK_TOPOLOGY_CHANGE:-0} == 1 && $query_count -eq 7 && -r ${MOCK_CHANGED} ]]; then
+    if [[ ${MOCK_TOPOLOGY_CHANGE:-0} == 1 && $query_count -eq 6 && -r ${MOCK_CHANGED} ]]; then
       cat "$MOCK_CHANGED"
       exit 0
     fi
@@ -53,11 +53,6 @@ if [[ ${1:-} == -j && ${2:-} == monitors ]]; then
     fi
     if [[ ${MOCK_TOPOLOGY_CHANGE_BEFORE_WORKSPACE:-0} == 1 && $query_count -ge 3 && -r ${MOCK_CHANGED} ]]; then
       cat "$MOCK_CHANGED"
-      exit 0
-    fi
-    if [[ ${MOCK_FINAL_WORKSPACE_VERIFY:-0} == 1 && -e ${MOCK_STATE}.workspace-swapped && ! -e ${MOCK_STATE}.final-query-used && -r ${MOCK_FINAL_QUERY_STATE} ]]; then
-      : >"${MOCK_STATE}.final-query-used"
-      cat "$MOCK_FINAL_QUERY_STATE"
       exit 0
     fi
     if [[ ${MOCK_POST_SYNC_LAYOUT:-0} == 1 && -r ${MOCK_PERSISTED}
@@ -116,50 +111,8 @@ if [[ ${1:-} == eval ]]; then
     fi
     printf '%s\n' false >"${MOCK_STATE}.autoreload"
   fi
-  workspace_swap_failed=false
-  partial_swap_triggered=false
   while IFS= read -r dispatch; do
-    if [[ $dispatch == *'legacy.swap_monitors'* ]]; then
-      if [[ $dispatch =~ monitor1[[:space:]]*=[[:space:]]*\"([^\"]+)\".*monitor2[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
-        monitor1=${BASH_REMATCH[1]}
-        monitor2=${BASH_REMATCH[2]}
-        printf 'swap_monitors monitor1=%s monitor2=%s\n' "$monitor1" "$monitor2" >>"${MOCK_WORKSPACE_LOG:?}"
-        if [[ ${MOCK_FAIL_WORKSPACE_SWAP:-0} == 1 ]]; then
-          workspace_swap_failed=true
-          continue
-        fi
-        partial_swap_now=false
-        if [[ ${MOCK_PARTIAL_WORKSPACE_SWAP:-0} == 1
-            && ! -e ${MOCK_STATE}.partial-swap-used
-            && $partial_swap_triggered == false ]]; then
-          partial_swap_triggered=true
-          partial_swap_now=true
-          : >"${MOCK_STATE}.partial-swap-used"
-        elif [[ $workspace_swap_failed == true ]]; then
-          continue
-        fi
-        swap_tmp="${MOCK_STATE}.workspace-swap"
-        jq --arg monitor1 "$monitor1" --arg monitor2 "$monitor2" '
-          . as $monitors
-          | ($monitors | map(select(.name == $monitor1)) | first) as $first
-          | ($monitors | map(select(.name == $monitor2)) | first) as $second
-          | map(
-              if .name == $monitor1 then
-                .activeWorkspace = $second.activeWorkspace
-              elif .name == $monitor2 then
-                .activeWorkspace = $first.activeWorkspace
-              else . end
-            )
-        ' "$MOCK_STATE" >"$swap_tmp"
-        mv -- "$swap_tmp" "$MOCK_STATE"
-        : >"${MOCK_STATE}.workspace-swapped"
-        if [[ $partial_swap_now == true ]]; then
-          workspace_swap_failed=true
-        fi
-      else
-        printf 'workspace_dispatch %s\n' "$dispatch" >>"${MOCK_WORKSPACE_LOG:?}"
-      fi
-    elif [[ $dispatch == *'hl.dsp.workspace.change_id'* ]]; then
+    if [[ $dispatch == *'hl.dsp.workspace.change_id'* ]]; then
       if [[ $dispatch =~ workspace[[:space:]]*=[[:space:]]*([0-9]+).*id[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
         old=${BASH_REMATCH[1]}
         new=${BASH_REMATCH[2]}
@@ -179,10 +132,6 @@ if [[ ${1:-} == eval ]]; then
       printf 'workspace_dispatch %s\n' "$dispatch" >>"${MOCK_WORKSPACE_LOG:?}"
     fi
   done <<<"$lua"
-  if [[ $workspace_swap_failed == true ]]; then
-    printf '%s\n' 'mock workspace swap failure' >&2
-    exit 1
-  fi
   if [[ $lua == *hl.monitor* ]]; then
     count=0
     [[ -r ${MOCK_STATE}.eval-count ]] && count=$(<"${MOCK_STATE}.eval-count")
@@ -269,7 +218,7 @@ set_fixture() {
   cp -- "$MOCK_STATE" "$MOCK_ORIGINAL"
   : >"$MOCK_LOG"
   : >"$MOCK_WORKSPACE_LOG"
-  rm -f -- "$MOCK_STATE.eval-count" "$MOCK_STATE.monitor-queries" "$MOCK_STATE.order-mv-failed" "$MOCK_STATE.autoreload-restore-failed" "$MOCK_STATE.final-query-used" "$MOCK_STATE.workspace-swapped" "$MOCK_STATE.partial-swap-used"
+  rm -f -- "$MOCK_STATE.eval-count" "$MOCK_STATE.monitor-queries" "$MOCK_STATE.order-mv-failed" "$MOCK_STATE.autoreload-restore-failed"
   printf '%s\n' false >"$MOCK_STATE.autoreload"
   cp -- "$MOCK_STATE" "$MOCK_APPLIED"
 }
@@ -392,12 +341,6 @@ JSON
   {"name":"B","width":1000,"height":800,"refreshRate":60,"x":1000,"y":0,"scale":1,"transform":0,"focused":false,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":4,"name":"chat"},"specialWorkspace":{"id":0,"name":""}}
 ]
 JSON
-  cat >"$dir/workspace-final-bad.json" <<'JSON'
-[
-  {"name":"B","width":1000,"height":800,"refreshRate":60,"x":0,"y":0,"scale":1,"transform":0,"focused":false,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":99,"name":"wrong-b"},"specialWorkspace":{"id":0,"name":""}},
-  {"name":"A","width":1000,"height":800,"refreshRate":60,"x":1000,"y":0,"scale":1,"transform":0,"focused":true,"disabled":false,"mirrorOf":"none","activeWorkspace":{"id":98,"name":"wrong-a"},"specialWorkspace":{"id":0,"name":""}}
-]
-JSON
 }
 
 new_case() {
@@ -412,7 +355,7 @@ new_case() {
   export PATH="$mock_bin:/usr/bin:/bin"
   export MOCK_ACTIVEWINDOW_JSON='{"address":"0xabc"}'
   export MOCK_CLIENTS_JSON='[{"address":"0xabc","monitor":0}]'
-  export MOCK_FAIL_APPLY=0 MOCK_FAIL_RESTORE=0 MOCK_FAIL_ORDER_MV=0 MOCK_LUAC_FAIL=0 MOCK_TOPOLOGY_CHANGE=0 MOCK_TOPOLOGY_CHANGE_BEFORE_WORKSPACE=0 MOCK_PRE_LAYOUT_REVALIDATION=0 MOCK_FINAL_WORKSPACE_VERIFY=0 MOCK_FAIL_WORKSPACE_SWAP=0 MOCK_PARTIAL_WORKSPACE_SWAP=0 MOCK_POST_SYNC_LAYOUT=0 MOCK_PAUSE_AFTER_APPLY=0 MOCK_FAIL_AUTORELOAD_RESTORE_ONCE=0
+  export MOCK_FAIL_APPLY=0 MOCK_FAIL_RESTORE=0 MOCK_FAIL_ORDER_MV=0 MOCK_LUAC_FAIL=0 MOCK_TOPOLOGY_CHANGE=0 MOCK_TOPOLOGY_CHANGE_BEFORE_WORKSPACE=0 MOCK_PRE_LAYOUT_REVALIDATION=0 MOCK_POST_SYNC_LAYOUT=0 MOCK_PAUSE_AFTER_APPLY=0 MOCK_FAIL_AUTORELOAD_RESTORE_ONCE=0
   set_fixture "$fixture"
 }
 
@@ -495,14 +438,6 @@ workspace_dispatch_count() {
 
 assert_no_workspace_dispatches() {
   [[ $(workspace_dispatch_count) -eq 0 ]] || fail "workspace dispatches were issued: $(<"$MOCK_WORKSPACE_LOG")"
-}
-
-assert_workspace_dispatches_are_swaps() {
-  local line
-  while IFS= read -r line; do
-    [[ $line == 'swap_monitors monitor1='* ]] || fail "unexpected workspace dispatch: $line"
-    [[ $line == *' monitor2='* ]] || fail "malformed workspace swap dispatch: $line"
-  done <"$MOCK_WORKSPACE_LOG"
 }
 
 assert_active_workspace() {

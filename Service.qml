@@ -8,8 +8,6 @@ import Quickshell.Io
 Item {
   id: root
 
-  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME")
-    || ((Quickshell.env("HOME") || "") + "/.local/state")
   readonly property string reorderDisplaysHelper: Qt.resolvedUrl("scripts/reorder-displays").toString().replace("file://", "")
 
   function startStartupApplySaved() {
