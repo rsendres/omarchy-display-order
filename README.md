@@ -1,6 +1,6 @@
 # Omarchy Display Order
 
-Drag-and-drop display ordering for Omarchy. Arrange your monitors visually and keep Hyprland workspaces, scaling, and layout in sync.
+Drag-and-drop display ordering for Omarchy. Arrange your monitors visually and keep Hyprland display layout and scaling in sync.
 
 ## What it does
 
@@ -27,7 +27,6 @@ After dragging Monitor 2 upward:
 - Hover-to-identify physical displays
 - Automatic logical positioning
 - Scale-aware layout calculations
-- Workspace base alignment
 - Persistence across reboot
 - Reload-safe monitor configuration
 - Support for one, two, or three or more monitors
@@ -59,6 +58,8 @@ Open **Setup → Display**. In **DISPLAYS**, drag the numbered monitor rows into
 
 The first row becomes the leftmost logical display in Hyprland, followed by the remaining rows from left to right.
 
+When displays are explicitly reordered and their active workspaces are exactly the default numeric set `1..N`, the plugin renumbers those workspace IDs to match the new display slots. This does not move workspaces, windows, or clients between physical outputs. Custom, named, mixed, and special workspaces are left untouched; only the display geometry changes.
+
 ### Identify a display
 
 Park the mouse pointer over a monitor row for two seconds to print its current
@@ -73,7 +74,7 @@ exit, and is disabled during drag-and-drop. It uses the Hyprland output name
 - Hyprland receives a layout with `0x0` for the first monitor and `auto-right` for each following monitor.
 - Logical widths account for each monitor's scale and rotation.
 - A managed block in `monitors.lua` makes reloads safe.
-- `Service.qml` restores the saved state during startup.
+- `Service.qml` restores the saved display order/layout during startup. The plugin neither imposes workspace numbers nor creates or permanently manages workspaces.
 
 ## Uninstall / rollback
 

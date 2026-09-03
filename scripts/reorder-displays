@@ -26,12 +26,25 @@ transaction_autoreload_restored=false
 transaction_active=false
 transaction_committed=false
 transaction_rollback_done=false
+live_layout_attempted=false
+change_id_journal_file="$runtime_dir/reorder-displays-change-id.json"
+change_id_journal_active=false
+base_normalization=false
+before_outputs_json='[]'
+before_client_outputs_json='[]'
+# The process-wide lock serializes reorders, so one reserved rule/tag pair can
+# be reused. Reusing the named rule prevents disabled runtime rules accumulating
+# in Hyprland after each reorder.
+reorder_suppression_tag='omarchy_display_order_reorder'
+reorder_suppression_rule='omarchy_display_order_no_animation'
+change_id_targets_json='[]'
+change_id_temporary_id=0
 startup_mode=false
 startup_claim_existing=false
 startup_claim_file=''
 
 usage() {
-  printf 'Usage:\n  %s --dry-run MONITOR [MONITOR ...]\n  %s --apply-live MONITOR [MONITOR ...]\n  %s --save-order MONITOR [MONITOR ...]\n  %s --apply-and-save MONITOR [MONITOR ...]\n  %s --startup-apply-saved\n  %s --apply-saved\n  %s --restore-base-workspaces\n  %s --set-scale PRESET\n  %s --print-config-block\n  %s --sync-config\n  %s --remove-config-block\n  %s --restore-last\n' "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" >&2
+  printf 'Usage:\n  %s --dry-run MONITOR [MONITOR ...]\n  %s --apply-live MONITOR [MONITOR ...]\n  %s --save-order MONITOR [MONITOR ...]\n  %s --apply-and-save MONITOR [MONITOR ...]\n  %s --startup-apply-saved\n  %s --apply-saved\n  %s --set-scale PRESET\n  %s --print-config-block\n  %s --sync-config\n  %s --remove-config-block\n  %s --restore-last\n' "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" >&2
   exit 2
 }
 fail() { printf 'reorder-displays: %s\n' "$*" >&2; exit 1; }
@@ -174,6 +187,49 @@ apply_layout() {
   fi
 }
 
+# Interactive geometry changes briefly tag the clients that were on the
+# affected outputs. The dynamic no-animation rule and its compositor-owned
+# timer live in the same eval as the monitor mutations, so a failed monitor
+# call cannot strand the temporary tags or rule.
+apply_interactive_reorder_layout() {
+  local geometry_lua lua target_lua cleanup_lua output
+  geometry_lua=$(monitor_lua <<<"$1") || return 1
+  [[ -n $geometry_lua ]] || return 1
+  target_lua=$(jq -r --arg tag "$reorder_suppression_tag" '
+    .[]
+    | "hl.dispatch(hl.dsp.window.tag({ window = "
+      + (("address:" + .address) | @json)
+      + ", tag = " + (("+" + $tag) | @json) + " }))"
+  ' <<<"$before_client_outputs_json") || return 1
+  cleanup_lua=$(jq -r --arg tag "$reorder_suppression_tag" '
+    .[]
+    | "hl.dispatch(hl.dsp.window.tag({ window = "
+      + (("address:" + .address) | @json)
+      + ", tag = " + (("-" + $tag) | @json) + " }))"
+  ' <<<"$before_client_outputs_json") || return 1
+
+  lua=$(printf '%s\n' \
+    'local displayOrderNoAnimationRule = hl.window_rule({' \
+    "  name = $(jq -Rn --arg value "$reorder_suppression_rule" '$value')," \
+    "  match = { tag = $(jq -Rn --arg value "$reorder_suppression_tag" '$value') }," \
+    '  no_anim = true,' \
+    '})' \
+    'displayOrderNoAnimationRule:set_enabled(false)' \
+    '-- Cleanup is deliberately compositor-owned and is scheduled before any mutation.' \
+    'hl.timer(function()' \
+    '  displayOrderNoAnimationRule:set_enabled(false)' \
+    "$cleanup_lua" \
+    "end,{timeout=150,type='oneshot'})" \
+    "$target_lua" \
+    'displayOrderNoAnimationRule:set_enabled(true)' \
+    "$geometry_lua") || return 1
+
+  if ! output=$(hyprctl eval "$lua" 2>&1); then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
 # This is intentionally the same clean-scale rule as
 # omarchy-hyprland-monitor-scaling. The UI's 1.6 preset therefore becomes the
 # mode-valid 1.66667 scale on a 1600x900 output.
@@ -205,115 +261,303 @@ monitor_auto_right_lua() {
 }
 
 apply_scale_layout() {
-  local expected=$1 focus=$2 lua focus_code output
+  local expected=$1 lua output
   lua=$(monitor_auto_right_lua <<<"$expected") || return 1
   [[ -n $lua ]] || return 1
-  focus_code=$(focus_lua "$focus" || true)
-  [[ -z $focus_code ]] || lua+=$'\n'"$focus_code"
   if ! output=$(hyprctl eval "$lua" 2>&1); then
     printf '%s\n' "$output" >&2
     return 1
   fi
 }
 
-# hyprctl eval receives a dispatcher expression; execute the modern dispatcher
-# object explicitly. This is the same hl.dsp API used by the active bindings.
-workspace_move_lua() {
-  jq -r '.[] | "hl.dispatch(hl.dsp.workspace.move({ workspace = " + (.workspaceId | tostring) + ", monitor = " + (.monitor | @json) + " }))"' <<<"$1"
-}
-
-workspace_focus_lua() {
-  jq -r '.[] | "hl.dispatch(hl.dsp.focus({ workspace = " + (.workspaceId | tostring) + " }))"' <<<"$1"
-}
-
-focus_lua() {
-  local focus=$1
-  if jq -e '.activeWindowAddress != null and (.activeWindowAddress | test("^0x[1-9A-Fa-f][0-9A-Fa-f]*$"))' <<<"$focus" >/dev/null; then
-    jq -r '"hl.dispatch(hl.dsp.focus({ window = " + (.activeWindowAddress | @json) + " }))"' <<<"$focus"
-  elif jq -e '.focusedMonitor != null' <<<"$focus" >/dev/null; then
-    jq -r '"hl.dispatch(hl.dsp.focus({ monitor = " + (.focusedMonitor | @json) + " }))"' <<<"$focus"
-  fi
-}
-
-capture_reorder_focus() {
-  local active_window_json=$1
-  focused_state=$(jq -ce --argjson active "$active_window_json" '
-    ([ .[] | select(.focused // false) ] | first) as $focused
-    | {
-        focusedMonitor: ($focused.name // null),
-        activeWindowAddress: ($active.address // null)
-      }
-  ' <<<"$monitors_json") || return 1
-}
-
-restore_workspace_slots() {
-  local current_json=$1 involved_json=${2:-null} current_slots moves lua output focus_code
-  local move_failed=false focus_failed=false
-
-  current_slots=$(jq -ce --argjson involved "$involved_json" '
+eligible_slots() {
+  jq -ce '
+    def identity($workspace): {
+      id: (if (($workspace.id? // 0) | type) == "number" then ($workspace.id? // 0) else 0 end),
+      name: (if (($workspace.name? // "") | type) == "string" then ($workspace.name? // "") else "" end)
+    };
     [ .[]
-      | select($involved == null or (.name as $name | $involved | index($name)))
       | select((.disabled // false) | not)
       | select((.mirrorOf // "none") == "none" or (.mirrorOf // "none") == "")
-      | { monitor: .name, x, workspaceId: (.activeWorkspace.id // 0) }
+      | {output: .name, x, activeWorkspace: identity(.activeWorkspace), specialWorkspace: identity(.specialWorkspace)}
     ]
-    | sort_by([.x, .monitor])
+    | sort_by([.x, .output])
     | to_entries
-    | map({ slot: .key, monitor: .value.monitor, workspaceId: .value.workspaceId })
-  ' <<<"$current_json") || {
-    printf 'reorder-displays: could not determine workspace slots\n' >&2
-    return 1
-  }
+    | map(.value + {slot: .key})
+    | if (map(.output) | unique | length) == length then . else error("duplicate eligible output") end
+  ' <<<"$1"
+}
 
-  # The final logical order defines only the base workspaces: slot 0 gets
-  # workspace 1, slot 1 gets workspace 2, and so on. Other workspaces are
-  # never selected or redistributed here.
-  [[ $(jq 'length' <<<"$current_slots") -gt 0 ]] || return 0
-  moves=$(jq -ce '
-    map(select(.workspaceId != (.slot + 1))
-      | { workspaceId: (.slot + 1), monitor, slot })
-  ' <<<"$current_slots") || {
-    printf 'reorder-displays: could not prepare workspace transfer\n' >&2
-    return 1
-  }
+encode_requested_order() {
+  jq -cn --args '$ARGS.positional' "$@"
+}
 
-  [[ $(jq 'length' <<<"$moves") -gt 0 ]] || return 0
-  printf 'Restoring base workspaces by logical slot...\n'
-  while IFS= read -r lua; do
-    if ! output=$(hyprctl eval "$lua" 2>&1); then
-      printf 'reorder-displays: workspace transfer failed: %s\n' "$output" >&2
-      move_failed=true
-    fi
-  done < <(workspace_move_lua "$moves")
-
-  # Moving a workspace changes its monitor but does not necessarily make it
-  # active there. Activate each moved base workspace before restoring focus.
-  if [[ $move_failed == false ]]; then
-    while IFS= read -r lua; do
-      if ! output=$(hyprctl eval "$lua" 2>&1); then
-        printf 'reorder-displays: workspace activation failed: %s\n' "$output" >&2
-        move_failed=true
-      fi
-    done < <(workspace_focus_lua "$moves")
-  fi
-
-  # Moving a workspace may make Hyprland focus a destination temporarily.
-  # Restore the active window when possible; that also restores its workspace
-  # and monitor. If no window was active, restore the original monitor.
-  focus_code=$(focus_lua "$focused_state" || true)
-  if [[ -n $focus_code ]] && ! output=$(hyprctl eval "$focus_code" 2>&1); then
-    printf 'reorder-displays: could not restore focus: %s\n' "$output" >&2
-    focus_failed=true
-  fi
-  if [[ $move_failed == true || $focus_failed == true ]]; then
-    printf 'reorder-displays: monitor layout remains applied; refresh state after workspace/focus transfer errors\n' >&2
-    return 1
+validate_requested_order() {
+  local requested=$1 eligible
+  eligible=$(eligible_slots "$monitors_json") || fail 'could not determine eligible monitors'
+  if ! jq -ne --argjson requested "$requested" --argjson eligible "$eligible" \
+      --argjson monitors "$monitors_json" '
+      ($requested | type == "array" and length > 0 and (unique | length) == length)
+      and (($requested | sort) == ($eligible | map(.output) | sort))
+      and all($requested[]; . as $name
+        | ([ $monitors[] | select(.name == $name) ] | length) == 1)
+    ' >/dev/null; then
+    fail "requested monitor order is not exactly the currently eligible output set (requested=$requested eligible=$(jq -c '[.[].output]' <<<"$eligible"))"
   fi
 }
+
+workspace_identity_matches() {
+  jq -e --argjson before "$1" --argjson current "$2" '
+    def same_identity($old; $now):
+      (($old.id != 0 and $now.id != 0 and $old.id == $now.id
+        and ($old.name == "" or $now.name == "" or $old.name == $now.name))
+       or ($old.id == 0 and $now.id == 0 and $old.name != ""
+           and $now.name != "" and $old.name == $now.name));
+    all($before[]; . as $old
+      | ($current[] | select(.output == $old.output)) as $now
+      | same_identity($old.activeWorkspace; $now.activeWorkspace))
+  ' <<<"$2" >/dev/null
+}
+
+strict_pre_layout_revalidate() {
+  local requested=$1 current current_slots
+  if ! current=$(hyprctl -j monitors all); then
+    printf 'reorder-displays: could not requery monitors before live apply; no monitor eval issued\n' >&2
+    return 1
+  fi
+  if ! current_slots=$(eligible_slots "$current"); then
+    printf 'reorder-displays: could not parse monitors before live apply; no monitor eval issued\n' >&2
+    return 1
+  fi
+  if ! jq -ne --argjson requested "$requested" --argjson current "$current_slots" \
+      --argjson before "$before_outputs_json" --argjson monitors "$current" '
+      ($current | map(.output)) as $outputs
+      | ($outputs | length) == ($requested | length)
+        and ($outputs | unique | length) == ($outputs | length)
+        and ($outputs | sort) == ($requested | sort)
+        and $outputs == ($before | map(.output))
+        and all($requested[]; . as $name
+          | ($outputs | map(select(. == $name)) | length) == 1
+          and ([ $monitors[] | select(.name == $name) ] | length) == 1)
+    ' >/dev/null; then
+    printf 'reorder-displays: eligible monitor set changed before live apply; no monitor eval issued\n' >&2
+    return 1
+  fi
+  if [[ $base_normalization == true ]] && ! workspace_identity_matches "$before_outputs_json" "$current_slots"; then
+    printf 'reorder-displays: active normal workspace changed before live apply; no monitor eval issued\n' >&2
+    return 1
+  fi
+  if [[ $base_normalization == true ]] && special_blocks_normalization "$current_slots" "$requested"; then
+    printf 'reorder-displays: visible special workspace appeared; applying geometry without base workspace renumbering\n' >&2
+    base_normalization=false
+  fi
+}
+
+# Base workspace normalization is deliberately identity-only: change_id never
+# moves a workspace, client, or output. It runs only when active workspaces are
+# the uncustomized numeric 1..N set.
+client_output_map() {
+  jq -ce --argjson monitors "$1" '
+    ($monitors | map({id, name})) as $outputs
+    | [ .[]
+        | select((.address? | type) == "string")
+        | select((.monitor? | type) == "number")
+        | (.monitor as $monitor | ($outputs[] | select(.id == $monitor) | .name)) as $output
+        | select($output != null)
+        | {address, output: $output}
+      ]
+    | if (map(.address) | unique | length) == length then . else error("duplicate client address") end
+  ' <<<"$2"
+}
+
+base_slots_are_normalizable() {
+  jq -e --argjson count "$2" '
+    (length == $count)
+    and ([.[].activeWorkspace.id] | sort) == [range(1; $count + 1)]
+    and all(.[]; .activeWorkspace.name == (.activeWorkspace.id | tostring))
+  ' <<<"$1" >/dev/null
+}
+
+special_blocks_normalization() {
+  jq -e --argjson requested "$2" '
+    any(.[]; . as $slot
+      | $requested[$slot.slot] != $slot.output
+      and ((.specialWorkspace.id != 0) or (.specialWorkspace.name != "")))
+  ' <<<"$1" >/dev/null
+}
+
+capture_reorder_state() {
+  local requested=$1 active_window_json clients_json focused_monitor
+  before_outputs_json=$(eligible_slots "$monitors_json") || fail 'could not capture monitor workspace slots'
+  reorder_workspace_json=$(hyprctl -j workspaces) || fail 'could not capture workspaces before reorder'
+  clients_json=$(hyprctl -j clients) || fail 'could not capture clients before reorder'
+  before_client_outputs_json=$(client_output_map "$monitors_json" "$clients_json") \
+    || fail 'could not map clients to physical outputs before reorder'
+  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+  focused_monitor=$(jq -r '[.[] | select(.focused // false) | .name] | first // ""' <<<"$monitors_json") \
+    || fail 'could not capture focused monitor'
+  active_window_address=$(jq -r '.address // ""' <<<"$active_window_json") || fail 'could not capture active window'
+  focused_physical_output=$focused_monitor
+  requested_order_json=$requested
+  base_normalization=false
+  if base_slots_are_normalizable "$before_outputs_json" "$(jq 'length' <<<"$before_outputs_json")"; then
+    if special_blocks_normalization "$before_outputs_json" "$requested"; then
+      printf 'reorder-displays: visible special workspace; applying display geometry without base workspace renumbering\n' >&2
+    else
+      base_normalization=true
+    fi
+  else
+    printf 'reorder-displays: active workspaces are not the normal 1..N base set; applying display geometry without renumbering\n' >&2
+  fi
+}
+
+find_free_workspace_id() {
+  jq -r '[.[].id | select(type == "number" and . > 0)] | (max? // 0) + 1' <<<"$1"
+}
+
+change_id_plan() {
+  local slots=$1 targets=$2 temporary=$3
+  declare -A target=() seen=()
+  local output old wanted start current predecessor plan='[]'
+  while IFS=$'\t' read -r output old; do
+    wanted=$(jq -r --arg output "$output" '.[] | select(.output == $output) | .id' <<<"$targets") || return 1
+    target[$old]=$wanted
+  done < <(jq -r '.[] | "\(.output)\t\(.activeWorkspace.id)"' <<<"$slots")
+  for start in "${!target[@]}"; do
+    [[ ${target[$start]} == "$start" || -n ${seen[$start]:-} ]] && continue
+    plan=$(jq -ce --argjson old "$start" --argjson new "$temporary" '. + [{workspace:$old,id:$new}]' <<<"$plan") || return 1
+    seen[$start]=1
+    current=$start
+    while :; do
+      predecessor=''
+      for old in "${!target[@]}"; do
+        [[ ${target[$old]} == "$current" ]] && { predecessor=$old; break; }
+      done
+      [[ -n $predecessor ]] || return 1
+      if [[ $predecessor == "$start" ]]; then
+        plan=$(jq -ce --argjson old "$temporary" --argjson new "${target[$start]}" '. + [{workspace:$old,id:$new}]' <<<"$plan") || return 1
+        break
+      fi
+      plan=$(jq -ce --argjson old "$predecessor" --argjson new "$current" '. + [{workspace:$old,id:$new}]' <<<"$plan") || return 1
+      seen[$predecessor]=1
+      current=$predecessor
+    done
+  done
+  printf '%s\n' "$plan"
+}
+
+change_id_lua() {
+  jq -r '.[] | "hl.dispatch(hl.dsp.workspace.change_id({ workspace = " + (.workspace | tostring) + ", id = " + (.id | tostring) + " }))"' <<<"$1"
+}
+
+write_change_id_journal() {
+  local payload=$1 temp_file
+  umask 077
+  mkdir -p "$runtime_dir" || return 1
+  temp_file=$(mktemp "$runtime_dir/.change-id.XXXXXX") || return 1
+  printf '%s\n' "$payload" >"$temp_file" || { rm -f "$temp_file"; return 1; }
+  chmod 600 "$temp_file" || { rm -f "$temp_file"; return 1; }
+  mv -f "$temp_file" "$change_id_journal_file" || { rm -f "$temp_file"; return 1; }
+  change_id_journal_active=true
+}
+
+clear_change_id_journal() {
+  [[ $change_id_journal_active == true || -e $change_id_journal_file ]] || return 0
+  rm -f "$change_id_journal_file" || return 1
+  change_id_journal_active=false
+}
+
+verify_client_outputs() {
+  local clients_json=$1 current actual
+  current=$(client_output_map "$2" "$clients_json") || return 1
+  jq -ne --argjson before "$before_client_outputs_json" --argjson after "$current" '
+    all($before[]; . as $client
+      | ([$after[] | select(.address == $client.address) | .output] | first) as $output
+      | $output == $client.output)
+  ' >/dev/null
+}
+
+restore_change_ids_from_journal() {
+  local journal=$1 current_monitors current_slots workspaces temporary plan lua
+  current_monitors=$(hyprctl -j monitors all) || return 1
+  current_slots=$(eligible_slots "$current_monitors") || return 1
+  workspaces=$(hyprctl -j workspaces) || return 1
+  temporary=$(find_free_workspace_id "$workspaces") || return 1
+  plan=$(change_id_plan "$current_slots" "$(jq -c '.original' <<<"$journal")" "$temporary") || return 1
+  [[ $(jq 'length' <<<"$plan") -eq 0 ]] || {
+    lua=$(change_id_lua "$plan") || return 1
+    hyprctl eval "$lua" >/dev/null || return 1
+  }
+  current_monitors=$(hyprctl -j monitors all) || return 1
+  current_slots=$(eligible_slots "$current_monitors") || return 1
+  jq -ne --argjson original "$(jq -c '.original' <<<"$journal")" --argjson current "$current_slots" '
+    all($original[]; . as $wanted | ($current[] | select(.output == $wanted.output) | .activeWorkspace.id) == $wanted.id)
+  ' >/dev/null
+}
+
+recover_change_id_journal() {
+  local journal
+  [[ -e $change_id_journal_file ]] || return 0
+  journal=$(jq -ce 'if has("original") and (.original | type == "array") then . else error("invalid change-id journal") end' "$change_id_journal_file") \
+    || fail "incomplete change-id journal is invalid: $change_id_journal_file"
+  if ! restore_change_ids_from_journal "$journal"; then
+    fail "incomplete change-id journal could not be safely recovered; manual recovery is required: $change_id_journal_file"
+  fi
+  clear_change_id_journal || fail 'could not remove recovered change-id journal'
+}
+
+restore_reorder_focus() {
+  local active clients_json focus_code output
+  active=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+  [[ $(jq -r '.address // ""' <<<"$active") == "$active_window_address" ]] && return 0
+  if [[ $active_window_address =~ ^0x[1-9A-Fa-f][0-9A-Fa-f]*$ ]] \
+      && clients_json=$(hyprctl -j clients 2>/dev/null) \
+      && jq -e --arg address "$active_window_address" 'any(.[]; .address == $address)' <<<"$clients_json" >/dev/null; then
+    focus_code=$(jq -rn --arg address "address:$active_window_address" '"hl.dispatch(hl.dsp.focus({ window = " + ($address | @json) + " }))"')
+  elif [[ -n $focused_physical_output ]]; then
+    focus_code=$(jq -rn --arg monitor "$focused_physical_output" '"hl.dispatch(hl.dsp.focus({ monitor = " + ($monitor | @json) + " }))"')
+  else
+    return 0
+  fi
+  output=$(hyprctl eval "$focus_code" 2>&1) || { printf 'reorder-displays: could not restore focus: %s\n' "$output" >&2; return 1; }
+}
+
+preserve_reorder_workspaces() {
+  local requested=$1 current_monitors current_slots clients_json workspaces temp lua journal
+  [[ $base_normalization == true ]] || { restore_reorder_focus || true; return 0; }
+  current_monitors=$(hyprctl -j monitors all) || return 1
+  current_slots=$(eligible_slots "$current_monitors") || return 1
+  [[ $(jq -c 'map(.output)' <<<"$current_slots") == "$requested" ]] || return 1
+  if special_blocks_normalization "$current_slots" "$requested"; then
+    printf 'reorder-displays: visible special workspace; skipping base workspace renumbering\n' >&2
+    restore_reorder_focus || true
+    return 0
+  fi
+  if ! base_slots_are_normalizable "$current_slots" "$(jq 'length' <<<"$current_slots")"; then return 1; fi
+  clients_json=$(hyprctl -j clients) || return 1
+  verify_client_outputs "$clients_json" "$current_monitors" || return 1
+  workspaces=$(hyprctl -j workspaces) || return 1
+  temp=$(find_free_workspace_id "$workspaces") || return 1
+  change_id_targets_json=$(jq -cn --argjson requested "$requested" '$requested | to_entries | map({output:.value,id:(.key + 1)})')
+  change_id_temporary_id=$temp
+  journal=$(jq -cn --argjson original "$before_outputs_json" --argjson targets "$change_id_targets_json" --argjson temp "$temp" '{operation:"change-id",original:($original | map({output,id:.activeWorkspace.id})),targets:$targets,temporary:$temp}')
+  write_change_id_journal "$journal" || return 1
+  lua=$(change_id_lua "$(change_id_plan "$current_slots" "$change_id_targets_json" "$temp")") || return 1
+  [[ -z $lua ]] || hyprctl eval "$lua" >/dev/null || return 1
+  current_monitors=$(hyprctl -j monitors all) || return 1
+  current_slots=$(eligible_slots "$current_monitors") || return 1
+  clients_json=$(hyprctl -j clients) || return 1
+  jq -ne --argjson requested "$requested" --argjson slots "$current_slots" '
+    ($slots | map(.output)) == $requested and all(range(0; ($slots | length)); $slots[.].activeWorkspace.id == (. + 1))
+  ' >/dev/null || return 1
+  verify_client_outputs "$clients_json" "$current_monitors" || return 1
+  [[ $transaction_active == true ]] || clear_change_id_journal || return 1
+  restore_reorder_focus
+}
 verify_layout() {
-  local expected=$1 actual
-  actual=$(hyprctl -j monitors all) || return 1
-  jq -e --argjson expected "$expected" '
+  local expected=$1 actual attempt
+  layout_matches() {
+    jq -e --argjson expected "$expected" '
     def close_enough(a; b): ((a - b) | fabs) < 0.01;
     . as $actual |
     reduce $expected[] as $wanted (true;
@@ -326,7 +570,24 @@ verify_layout() {
         and ((.disabled // false) == ($wanted.disabled // false))
         and ((.mirrorOf // "none") == ($wanted.mirrorOf // "none"))
       ) ] | length == 1)
-    )' <<<"$actual" >/dev/null
+    )' <<<"$1" >/dev/null
+  }
+
+  actual=$(hyprctl -j monitors all) || return 1
+  if layout_matches "$actual"; then
+    return 0
+  fi
+  # A compositor transaction can become visible a few milliseconds after the
+  # dispatcher returns. Poll only after the immediate verification mismatches.
+  for ((attempt = 1; attempt <= 10; attempt++)); do
+    sleep 0.05
+    actual=$(hyprctl -j monitors all) || continue
+    if layout_matches "$actual"; then
+      return 0
+    fi
+  done
+  printf 'reorder-displays: live layout did not match the requested geometry after polling\n' >&2
+  return 1
 }
 restore_snapshot() {
   local snapshot=$1
@@ -469,9 +730,19 @@ rollback_transaction() {
     printf 'reorder-displays: rollback failed: could not restore order.json\n' >&2
     rollback_failed=true
   fi
-  if ! restore_snapshot "$snapshot"; then
-    printf 'reorder-displays: rollback failed: could not restore the live display snapshot\n' >&2
-    rollback_failed=true
+  if [[ -e $change_id_journal_file ]]; then
+    if ! restore_change_ids_from_journal "$(jq -ce . "$change_id_journal_file")"; then
+      printf 'reorder-displays: rollback failed: could not safely restore workspace IDs; manual recovery may be required\n' >&2
+      rollback_failed=true
+    else
+      clear_change_id_journal || rollback_failed=true
+    fi
+  fi
+  if [[ $live_layout_attempted == true ]]; then
+    if ! restore_snapshot "$snapshot"; then
+      printf 'reorder-displays: rollback failed: could not restore the live display snapshot\n' >&2
+      rollback_failed=true
+    fi
   fi
   if ! restore_autoreload_state; then
     printf 'reorder-displays: rollback failed: could not restore Hyprland auto-reload state\n' >&2
@@ -611,32 +882,34 @@ verify_persisted_layout() {
 }
 
 apply_prepared_plan() {
+  local apply_command
   save_snapshot "$snapshot"
   printf 'Applying live display order...\n'
-  if ! apply_layout "$plan"; then
+  live_layout_attempted=true
+  if [[ $mode == --apply-live || $mode == --apply-saved || $mode == --apply-and-save ]]; then
+    apply_command=apply_interactive_reorder_layout
+  else
+    apply_command=apply_layout
+  fi
+  if ! "$apply_command" "$plan"; then
     printf 'reorder-displays: live apply failed; attempting automatic restore\n' >&2
-    transaction_rollback_done=true
     if ! restore_snapshot "$snapshot"; then
       printf 'reorder-displays: rollback failed after live apply failure\n' >&2
     fi
+    [[ $transaction_active == true ]] || transaction_rollback_done=true
     return 1
   fi
   if ! verify_layout "$plan"; then
-    printf 'reorder-displays: live layout verification failed; attempting automatic restore\n' >&2
-    transaction_rollback_done=true
+    printf 'reorder-displays: live layout verification failed; no workspace dispatch issued; attempting automatic restore\n' >&2
     if ! restore_snapshot "$snapshot"; then
       printf 'reorder-displays: rollback failed after live verification failure\n' >&2
     fi
+    [[ $transaction_active == true ]] || transaction_rollback_done=true
     return 1
   fi
-  if [[ $mode == --apply-live || $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
-    local post_layout_json
-    if post_layout_json=$(hyprctl -j monitors all); then
-      # Workspace transfer errors intentionally do not invalidate or roll back
-      # an already verified monitor layout.
-      restore_workspace_slots "$post_layout_json" "$involved_monitors_json" || true
-    else
-      printf 'reorder-displays: could not refresh monitors after reorder; skipping workspace transfer\n' >&2
+  if [[ $mode == --apply-live || $mode == --apply-saved || $mode == --apply-and-save ]]; then
+    if ! preserve_reorder_workspaces "$requested_order_json"; then
+      return 1
     fi
   fi
   if [[ $mode == --apply-and-save ]]; then
@@ -646,13 +919,50 @@ apply_prepared_plan() {
   fi
 }
 
+capture_scale_focus() {
+  local active_window_json
+  scale_focused_monitor=$(jq -r '[.[] | select(.focused // false) | .name] | first // ""' <<<"$1") \
+    || fail 'could not capture focused monitor for scale'
+  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
+  scale_active_window_address=$(jq -r '.address // ""' <<<"$active_window_json") \
+    || fail 'could not capture active window for scale'
+}
+
+restore_scale_focus() {
+  local focus_code output clients_json
+  if [[ $scale_active_window_address =~ ^0x[1-9A-Fa-f][0-9A-Fa-f]*$ ]] \
+      && clients_json=$(hyprctl -j clients 2>/dev/null) \
+      && jq -e --arg address "$scale_active_window_address" '
+        type == "array"
+        and any(.[];
+          .address? as $candidate
+          | if ($candidate | type) == "string" then
+              (($candidate | test("^0x[1-9A-Fa-f][0-9A-Fa-f]*$"))
+               and $candidate == $address)
+            else false end)
+      ' <<<"$clients_json" >/dev/null; then
+    focus_code=$(jq -rn --arg address "address:$scale_active_window_address" \
+      '"hl.dispatch(hl.dsp.focus({ window = " + ($address | @json) + " }))"')
+  elif [[ -n $scale_focused_monitor ]]; then
+    focus_code=$(jq -rn --arg monitor "$scale_focused_monitor" \
+      '"hl.dispatch(hl.dsp.focus({ monitor = " + ($monitor | @json) + " }))"')
+  else
+    return 0
+  fi
+  if ! output=$(hyprctl eval "$focus_code" 2>&1); then
+    printf 'reorder-displays: could not restore scale focus: %s\n' "$output" >&2
+    return 1
+  fi
+}
+
 set_saved_scale() {
-  local preset=$1 actual_monitors focus active_window scale_monitor scale_name scale_width scale_height effective_scale
+  local preset=$1 actual_monitors scale_monitor scale_name scale_width scale_height effective_scale
   local saved_current_order_text scale_snapshot
   local -a ordered=()
 
   validate_scale_preset "$preset"
   actual_monitors=$monitors_json
+  capture_scale_focus "$actual_monitors"
   scale_monitor=$(jq -ce '.[] | select(.focused == true)' <<<"$actual_monitors") || fail 'could not determine focused monitor for scale'
   scale_name=$(jq -r '.name' <<<"$scale_monitor")
   scale_width=$(jq -r '.width' <<<"$scale_monitor")
@@ -664,14 +974,8 @@ set_saved_scale() {
   ((${#ordered[@]} > 0)) || fail 'saved order has no active monitors'
   [[ " ${ordered[*]} " == *" $scale_name "* ]] || fail 'focused monitor is not currently eligible for scale'
 
-  # Capture the real pre-change layout for rollback and focus preservation.
+  # Capture the real pre-change layout for rollback.
   scale_snapshot=$(jq -ce --args '[.[] | select(.name as $name | $ARGS.positional | index($name)) | {name, width, height, refreshRate, x, y, scale, transform, disabled:(.disabled // false), mirrorOf:(.mirrorOf // "none")}]' "${ordered[@]}" <<<"$actual_monitors") || fail 'could not capture scale rollback state'
-  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
-  focused_state=$(jq -ce --argjson active "$active_window_json" '
-    ([ .[] | select(.focused // false) ] | first) as $focused
-    | { focusedMonitor: ($focused.name // null), activeWindowAddress: ($active.address // null) }
-  ' <<<"$actual_monitors") || fail 'could not capture focus before scale'
-
   # Reuse the existing logical-width calculation, changing only the focused
   # monitor. Every other monitor keeps the scale read from Hyprland; its
   # numeric x values are verification facts, while the live batch below uses
@@ -691,7 +995,8 @@ set_saved_scale() {
   transaction_active=true
   save_snapshot "$scale_snapshot"
   printf 'Applying scale and saved display order...\n'
-  if ! apply_scale_layout "$plan" "$focused_state"; then
+  live_layout_attempted=true
+  if ! apply_scale_layout "$plan"; then
     printf 'reorder-displays: scale/layout command failed; attempting automatic restore\n' >&2
     rollback_transaction || true
     return 1
@@ -710,6 +1015,11 @@ set_saved_scale() {
   fi
   if ! verify_layout "$plan"; then
     printf 'reorder-displays: Hyprland layout changed while persisting individual scale; attempting rollback\n' >&2
+    rollback_transaction || true
+    return 1
+  fi
+  if ! restore_scale_focus; then
+    printf 'reorder-displays: scale focus restoration failed; attempting rollback\n' >&2
     rollback_transaction || true
     return 1
   fi
@@ -959,7 +1269,7 @@ case $mode in
   --dry-run|--apply-live|--save-order|--apply-and-save) [[ $# -ge 1 ]] || usage ;;
   --startup-apply-saved) [[ $# -eq 0 ]] || usage ;;
   --set-scale) [[ $# -eq 1 ]] || usage ;;
-  --apply-saved|--restore-base-workspaces|--print-config-block|--sync-config|--remove-config-block|--restore-last) [[ $# -eq 0 ]] || usage ;;
+  --apply-saved|--print-config-block|--sync-config|--remove-config-block|--restore-last) [[ $# -eq 0 ]] || usage ;;
   *) usage ;;
 esac
 
@@ -997,6 +1307,10 @@ fi
 # Query exactly once, immediately before calculation. Neither the UI nor the
 # saved state can supply stale geometry to Hyprland.
 monitors_json=$(query_monitors_for_mode) || fail 'could not query Hyprland monitors'
+if [[ $mode == --apply-live || $mode == --apply-saved || $mode == --apply-and-save ]]; then
+  recover_change_id_journal
+  monitors_json=$(hyprctl -j monitors all) || fail 'could not query Hyprland monitors after journal recovery'
+fi
 if [[ $mode == --print-config-block ]]; then
   generate_config_block
   exit 0
@@ -1015,18 +1329,6 @@ if [[ $mode == --set-scale ]]; then
   set_saved_scale "$1"
   exit 0
 fi
-if [[ $mode == --restore-base-workspaces ]]; then
-  # This is intentionally a one-time normalization. It moves and activates
-  # only workspaces 1..N for the current left-to-right eligible monitor slots;
-  # it creates no persistent workspace rules and leaves every other workspace
-  # alone. Capture focus immediately before the dispatcher calls so startup
-  # retains the user's active window/monitor whenever Hyprland permits it.
-  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
-  capture_reorder_focus "$active_window_json" || fail 'could not capture focus before base workspace restore'
-  restore_workspace_slots "$monitors_json" null || fail 'base workspace restore failed; monitor layout remains applied'
-  printf 'Base workspaces restored by logical monitor slot.\n'
-  exit 0
-fi
 if [[ $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
   saved_current_order_text=$(order_for_current_monitors) || exit $?
   mapfile -t saved_current_order <<<"$saved_current_order_text"
@@ -1039,13 +1341,16 @@ else
 fi
 
 if [[ $mode == --apply-live || $mode == --apply-and-save || $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
-  if [[ $mode == --apply-saved || $mode == --startup-apply-saved ]]; then
-    involved_monitors_json=$(jq -cn --args '$ARGS.positional' "${saved_current_order[@]}") || fail 'could not record involved monitors'
-  else
-    involved_monitors_json=$(jq -cn --args '$ARGS.positional' "$@") || fail 'could not record involved monitors'
+  if [[ $mode != --startup-apply-saved ]]; then
+    if [[ $mode == --apply-saved ]]; then
+      requested_order_json=$(encode_requested_order "${saved_current_order[@]}" \
+        ) || fail 'could not record requested monitor order'
+    else
+      requested_order_json=$(encode_requested_order "$@") || fail 'could not record requested monitor order'
+    fi
+    validate_requested_order "$requested_order_json"
+    capture_reorder_state "$requested_order_json"
   fi
-  active_window_json=$(hyprctl -j activewindow 2>/dev/null || printf '{}')
-  capture_reorder_focus "$active_window_json" || fail 'could not capture focus before reorder'
 fi
 
 if [[ $mode == --dry-run ]]; then
@@ -1058,14 +1363,24 @@ fi
 if [[ $mode == --apply-and-save ]]; then
   # This is deliberately one transaction: the lock acquired above remains
   # held through the live change, workspace transfer, order write, and config
-  # sync. Signal traps restore the old bytes while this process is alive and
-  # before commit; SIGKILL or a process crash needs a journal to be recoverable.
+  # workspace preservation, order write, and config sync. Signal traps restore
+  # the old bytes while this process is alive and before commit; SIGKILL or a
+  # process crash needs a journal to be recoverable.
   capture_transaction_state
   capture_autoreload_state
   transaction_active=true
+  if ! strict_pre_layout_revalidate "$requested_order_json"; then
+    printf 'reorder-displays: strict pre-layout validation failed; attempting rollback without monitor eval\n' >&2
+    if ! rollback_transaction; then
+      printf 'reorder-displays: transaction rollback was incomplete; preferences/config may require manual recovery\n' >&2
+    fi
+    exit 1
+  fi
   if ! apply_prepared_plan; then
-    # apply_prepared_plan already attempted the live snapshot restore.
-    transaction_rollback_done=true
+    printf 'reorder-displays: live apply/workspace preservation failed; attempting rollback\n' >&2
+    if ! rollback_transaction; then
+      printf 'reorder-displays: transaction rollback was incomplete; preferences/config may require manual recovery\n' >&2
+    fi
     exit 1
   fi
   if ! verify_apply_and_save_topology "$@"; then
@@ -1108,15 +1423,13 @@ if [[ $mode == --apply-and-save ]]; then
     exit 1
   fi
   transaction_committed=true
-  if post_commit_layout_json=$(hyprctl -j monitors all 2>/dev/null); then
-    if ! restore_workspace_slots "$post_commit_layout_json" "$involved_monitors_json"; then
-      printf 'reorder-displays: workspace restoration after commit failed (best effort; layout and persistence remain committed)\n' >&2
-    fi
-  else
-    printf 'reorder-displays: could not refresh monitors for post-commit workspace restoration (best effort)\n' >&2
-  fi
+  clear_change_id_journal || fail 'could not clear committed change-id journal'
   printf 'Live display order applied, saved, and synced as one transaction.\n'
   exit 0
+fi
+
+if [[ $mode == --apply-live || $mode == --apply-saved ]]; then
+  strict_pre_layout_revalidate "$requested_order_json" || exit 1
 fi
 
 apply_prepared_plan
