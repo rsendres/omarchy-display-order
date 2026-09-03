@@ -551,7 +551,11 @@ preserve_reorder_workspaces() {
   restore_reorder_focus
 }
 verify_layout() {
-  local expected=$1 actual attempt
+  local expected=$1 actual attempt has_actual=false
+  if (($# >= 2)); then
+    actual=$2
+    has_actual=true
+  fi
   layout_matches() {
     jq -e --argjson expected "$expected" '
     def close_enough(a; b): ((a - b) | fabs) < 0.01;
@@ -569,9 +573,14 @@ verify_layout() {
     )' <<<"$1" >/dev/null
   }
 
-  actual=$(hyprctl -j monitors all) || return 1
+  if [[ $has_actual != true ]]; then
+    actual=$(hyprctl -j monitors all) || return 1
+  fi
   if layout_matches "$actual"; then
     return 0
+  fi
+  if [[ $has_actual == true ]]; then
+    return 1
   fi
   # A compositor transaction can become visible a few milliseconds after the
   # dispatcher returns. Poll only after the immediate verification mismatches.
@@ -748,6 +757,7 @@ rollback_transaction() {
 
 prepare_plan() {
   local name monitor disabled mirror_of width height scale transform horizontal_pixels logical_width
+  local -A monitor_by_name=()
   validate_names "$@"
 
   # Names from the UI/state are an order only; Hyprland is the source of all
@@ -759,6 +769,7 @@ prepare_plan() {
     mirror_of=$(jq -r '.mirrorOf // "none"' <<<"$monitor")
     [[ $disabled != true ]] || fail "refusing disabled monitor $name; it has no safe live-layout semantics"
     [[ $mirror_of == none || -z $mirror_of ]] || fail "refusing mirrored monitor $name (mirrorOf=$mirror_of); its source/target must be handled explicitly"
+    monitor_by_name[$name]=$monitor
   done
 
   snapshot=$(jq -ce --args '[.[] | select(.name as $name | $ARGS.positional | index($name)) | {name, width, height, refreshRate, x, y, scale, transform, disabled:(.disabled // false), mirrorOf:(.mirrorOf // "none")} ]' "$@" <<<"$monitors_json") || fail 'could not build rollback snapshot'
@@ -767,7 +778,7 @@ prepare_plan() {
   plan='[]'
   next_x=$base_x
   for name in "$@"; do
-    monitor=$(jq -ce --arg name "$name" '.[] | select(.name == $name)' <<<"$monitors_json")
+    monitor=${monitor_by_name[$name]}
     width=$(jq -r '.width' <<<"$monitor")
     height=$(jq -r '.height' <<<"$monitor")
     scale=$(jq -r '.scale' <<<"$monitor")
@@ -1346,6 +1357,13 @@ if [[ $mode == --apply-live || $mode == --apply-and-save || $mode == --apply-sav
     validate_requested_order "$requested_order_json"
     capture_reorder_state "$requested_order_json"
   fi
+fi
+
+# The authoritative startup query is already available; reuse verify_layout's
+# complete semantic comparison without issuing another monitor query.
+if [[ $mode == --startup-apply-saved ]] && verify_layout "$plan" "$monitors_json"; then
+  printf 'Saved display layout already matches the current layout; no live apply needed.\n'
+  exit 0
 fi
 
 if [[ $mode == --dry-run ]]; then

@@ -296,9 +296,12 @@ Panel {
     // Keep the last complete state instead of replacing it with an empty panel.
     if (!focused || !focused.name) return false
 
-    root.focusedMonitor = String(focused.name)
+    var nextFocusedMonitor = String(focused.name)
+    var focusedMonitorChanged = root.focusedMonitor !== nextFocusedMonitor
+    root.focusedMonitor = nextFocusedMonitor
     root.monitorScale = root.normalizeScale(focused.scale)
     root.updateDisplays(JSON.stringify(displaySummary), JSON.stringify(monitors))
+    if (focusedMonitorChanged) root.refreshBrightness()
     return true
   }
 
@@ -582,6 +585,7 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       refresh()
+      refreshBrightness()
       if (brightnessAvailable) {
         focusSection = "brightness"
         selectedIndex = -1
@@ -625,6 +629,14 @@ Panel {
     onTriggered: root.refreshBrightness()
   }
 
+  Timer {
+    id: brightnessRefreshFallback
+    interval: 30000
+    running: root.opened
+    repeat: true
+    onTriggered: root.refreshBrightness()
+  }
+
   Process {
     id: stateProc
     // Monitor metadata is fast and must not wait on DDC brightness I/O.
@@ -639,7 +651,6 @@ Panel {
       }
       if (valid) {
         root.stateRefreshRetries = 0
-        root.refreshBrightness()
       } else if (root.stateRefreshRetries < root.maxRefreshRetries) {
         root.stateRefreshRetries += 1
         stateRefreshRetry.restart()

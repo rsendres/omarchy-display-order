@@ -467,6 +467,10 @@ assert_no_monitor_eval() {
   done <"$MOCK_LOG"
 }
 
+monitor_query_count() {
+  awk '$0 == "-j monitors all" { count++ } END { print count + 0 }' "$MOCK_LOG"
+}
+
 assert_interactive_reorder_animation_suppression() {
   local monitor_eval tag
   monitor_eval=$(awk '
@@ -631,9 +635,11 @@ new_case "$test_root/fixtures/two-reversed.json"
 run_ok --save-order B A
 export HYPRLAND_INSTANCE_SIGNATURE=startup-no-workspace-dispatch
 run_ok --startup-apply-saved
+assert_no_monitor_eval
+[[ $(monitor_query_count) -eq 1 ]] || fail 'startup no-op issued an unnecessary monitor verification query'
 assert_no_interactive_reorder_animation_suppression
 assert_no_workspace_dispatches
-pass 'startup apply performs zero workspace dispatches when visual slots are already correct'
+pass 'startup apply performs no monitor apply when the saved layout is already correct'
 
 new_case "$test_root/fixtures/two-individual-scales.json"
 run_ok --save-order A B
@@ -1070,6 +1076,7 @@ run_ok --save-order B A
 set_applied_fixture "$test_root/fixtures/two-reversed.json"
 export HYPRLAND_INSTANCE_SIGNATURE=session-one
 run_ok --startup-apply-saved
+assert_mock_log_has_eval
 cmp -s -- "$MOCK_STATE" "$MOCK_APPLIED" || fail 'first startup claim did not apply the saved order'
 assert_no_workspace_dispatches
 [[ $(startup_claim_count) -eq 1 ]] || fail 'first startup did not create exactly one claim'
@@ -1079,7 +1086,7 @@ run_ok --startup-apply-saved
 assert_mock_log_empty
 assert_no_workspace_dispatches
 [[ $(startup_claim_count) -eq 1 ]] || fail 'same startup signature created another claim'
-pass 'the same Hyprland signature applies startup order only once'
+pass 'startup applies differing layout and skips a correct repeated layout'
 
 cp -- "$MOCK_ORIGINAL" "$MOCK_STATE"
 set_applied_fixture "$test_root/fixtures/two-reversed.json"
@@ -1116,7 +1123,7 @@ assert_mock_log_has_eval
 pass 'explicit apply-saved remains repeatable after a startup claim'
 
 new_case "$test_root/fixtures/two.json"
-run_ok --save-order A B
+run_ok --save-order B A
 export HYPRLAND_INSTANCE_SIGNATURE=session-terminal
 export MOCK_FAIL_APPLY=1
 run_fail --startup-apply-saved
