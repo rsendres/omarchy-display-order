@@ -33,7 +33,9 @@ After dragging Monitor 2 upward:
 
 ## Screenshots
 
-Screenshots will be added here.
+Drag a monitor row to change the left-to-right display order.
+
+![Dragging Monitor 1 below Monitor 2 changes their logical order](assets/drag-and-drop-ordering.png)
 
 ## Requirements
 
