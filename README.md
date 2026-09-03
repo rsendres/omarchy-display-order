@@ -1,114 +1,116 @@
 # Omarchy Display Order
 
-Ordene visualmente os monitores do Omarchy e mantenha a disposição lógica e a escala do Hyprland em sincronia.
+Visually reorder Omarchy monitors and keep Hyprland's logical layout and scaling in sync.
 
-## Visão geral
+🇺🇸 **English** | [🇧🇷 Português](README.pt-BR.md)
 
-O plugin adiciona numeração e arrastar-e-soltar à seção **Displays** do Omarchy. Ele reordena e identifica somente displays **habilitados e não espelhados**.
+## Overview
+
+The plugin adds numbering and drag-and-drop ordering to Omarchy's **Displays** section. It reorders and identifies only **enabled, non-mirrored displays**.
 
 ```text
-Antes                         Depois de arrastar o Monitor 2
+Before                         After dragging Monitor 2
 1  Monitor 1                  1  Monitor 2
 2  Monitor 2                  2  Monitor 1
 ```
 
-Ao soltar uma linha, a primeira posição vira o monitor lógico mais à esquerda; as demais seguem da esquerda para a direita. O plugin muda a geometria dos displays, não move janelas entre saídas físicas.
+When a row is dropped, the first position becomes the leftmost logical monitor; the remaining rows follow from left to right. The plugin changes display geometry; it does not move windows between physical outputs.
 
-### Recursos
+### Features
 
-- Arrastar-e-soltar para reordenar displays.
-- Identificação do monitor físico ao manter o cursor sobre uma linha.
-- Posicionamento lógico automático, considerando escala e rotação.
-- Escala no monitor em foco.
-- Ajuste de brilho e tamanho do texto.
-- Ativar ou desativar monitores (o último display ativo não pode ser desativado).
-- Persistência da ordem e restauração segura após recarregamentos.
+- Drag-and-drop display ordering.
+- Physical display identification by hovering over a row.
+- Automatic logical positioning that accounts for scale and rotation.
+- Scaling on the focused monitor.
+- Brightness and text-size controls.
+- Monitor enable/disable controls (the final active display cannot be disabled).
+- Persistent ordering and safe restoration after reloads.
 
-## Exemplo visual
+## Visual example
 
-Arraste uma linha para alterar a ordem lógica da esquerda para a direita:
+Drag a row to change the logical order from left to right:
 
-![Arrastar uma linha de monitor altera a ordem lógica](assets/drag-and-drop-ordering.png)
+![Dragging a monitor row changes the logical order](assets/drag-and-drop-ordering.png)
 
-## Requisitos
+## Requirements
 
-- Omarchy 4.0.1-1, com o sistema de plugins e os comandos `omarchy plugin`.
+- Omarchy 4.0.1-1, with its plugin system and `omarchy plugin` commands.
 - Hyprland 0.56.2.
-- `hyprctl`, `jq`, `flock` e `luac` (requisitos de execução do plugin; `luac` é necessário para validar e atualizar `monitors.lua`).
+- `hyprctl`, `jq`, `flock`, and `luac` (runtime requirements; `luac` is required to validate and update `monitors.lua`).
 
-Estas são as versões usadas no desenvolvimento e na validação. A compatibilidade com outras versões de Omarchy ou Hyprland não foi testada.
+These are the versions used during development and validation. Compatibility with other Omarchy or Hyprland versions has not been tested.
 
-## Instalação
+## Installation
 
-Instale pelo mecanismo oficial de plugins do Omarchy:
+Install through Omarchy's official plugin mechanism:
 
 ```bash
 omarchy plugin add https://github.com/rsendres/omarchy-display-order.git --enable
 ```
 
-## Uso
+## Usage
 
-Abra **Setup → Display**. Em **DISPLAYS**, arraste as linhas numeradas até a ordem desejada.
+Open **Setup → Display**. In **DISPLAYS**, drag the numbered rows into the desired order.
 
-### Identificar um display
+### Identify a display
 
-Mantenha o ponteiro sobre uma linha por dois segundos. O número da linha aparece no canto superior esquerdo do display físico correspondente e permanece enquanto o cursor estiver sobre a linha. Ele desaparece ao sair; durante o arrastar-e-soltar, a identificação fica desativada. O plugin usa o nome da saída do Hyprland, como `DP-2` ou `HDMI-A-1`.
+Hover over a row for two seconds. Its row number appears in the upper-left corner of the matching physical display and remains visible while the pointer stays over the row. It disappears on exit; identification is disabled during drag-and-drop. The plugin uses the Hyprland output name, such as `DP-2` or `HDMI-A-1`.
 
-### Escala, brilho e texto
+### Scale, brightness, and text size
 
-- **Scale** atua no monitor em foco e só pode ser aplicado com um `order.json` válido e com o monitor em foco habilitado e não espelhado.
-- As predefinições de escala são reduzidas à unidade válida mais próxima de `1/120`. A interface mostra duas casas decimais; a configuração gerada preserva seis algarismos significativos.
-- **Brightness** ajusta o brilho por meio de `omarchy-brightness-display` quando o controle está disponível; a disponibilidade é determinada pelo retorno válido desse comando.
-- **Text size** ajusta o tamanho do texto na interface.
-- Os controles de habilitar/desabilitar monitor respeitam a regra de que sempre deve restar um display ativo.
+- **Scale** acts on the focused monitor and requires a valid saved order in `order.json` and an enabled, non-mirrored focused monitor.
+- Scale presets are reduced to the nearest mode-valid `1/120` unit. The UI shows two decimal places; the generated configuration preserves six significant digits.
+- **Brightness** adjusts brightness through `omarchy-brightness-display` when control is available; availability is determined by that command returning a valid value.
+- **Text size** adjusts the interface text size.
+- Monitor enable/disable controls enforce the rule that at least one display must remain active.
 
 ### Workspaces
 
-Durante uma reordenação explícita, o plugin pode renumerar temporariamente apenas os workspaces base padrão elegíveis quando o conjunto ativo for exatamente `1..N` **e** os nomes corresponderem aos padrões. Workspaces nomeados, mistos ou especiais não são renumerados nem gerenciados permanentemente pelo plugin. A alteração não move janelas entre saídas físicas.
+During an explicit reorder, the plugin may temporarily renumber only eligible default base workspaces when the active workspace set is exactly `1..N` **and** their names match the defaults. Named, mixed, and special workspaces are neither renumbered nor permanently managed by the plugin. The change does not move windows between physical outputs.
 
 ```mermaid
 flowchart LR
-    A[Ordem salva] --> B{Workspaces ativos = 1..N<br/>com nomes padrão?}
-    B -- Sim --> C[Renumerar workspaces base]
-    B -- Não --> D[Manter workspaces]
-    C --> E[Aplicar geometria dos displays]
+    A[Saved order] --> B{Active workspaces = 1..N<br/>with default names?}
+    B -- Yes --> C[Renumber base workspaces]
+    B -- No --> D[Keep workspaces]
+    C --> E[Apply display geometry]
     D --> E
 ```
 
-## Persistência e restauração
+## Persistence and restoration
 
-- `order.json` é a fonte da ordem preferida dos monitores.
-- A geometria ao vivo pode usar coordenadas calculadas. As regras persistidas usam `0x0` no primeiro monitor e `auto-right` nos seguintes.
-- Na inicialização, a restauração exige uma ordem salva e o contexto de sessão/runtime do Hyprland. Ela roda uma vez por assinatura de sessão do Hyprland; se falhar, não fica tentando indefinidamente na mesma sessão.
-- Um bloco gerenciado em `monitors.lua` torna os recarregamentos seguros.
+- `order.json` is the source of the preferred monitor order.
+- Live geometry may use calculated coordinates. Persisted rules use `0x0` for the first monitor and `auto-right` for the following monitors.
+- At startup, restoration requires a saved order and Hyprland session/runtime context. It runs once per Hyprland session signature; if it fails, it is not retried endlessly during that session.
+- A managed block in `monitors.lua` makes reloads safe.
 
-## Recuperação e desinstalação
+## Recovery and uninstall
 
-Para remover **somente** o bloco `monitors.lua` gerenciado pelo plugin:
+To remove **only** the plugin-managed `monitors.lua` block:
 
 ```bash
 scripts/reorder-displays --remove-config-block
 ```
 
-Isso não é uma reversão completa da configuração. `--restore-last` tenta restaurar o último snapshot de layout ao vivo salvo pelo plugin; exige que esse snapshot exista e que o Hyprland esteja acessível, e não oferece garantia de recuperação offline.
+This is not a full configuration rollback. `--restore-last` requires a saved live-layout snapshot and accessible Hyprland, and makes a best-effort attempt to restore it; it does not provide offline recovery.
 
-Ao reescrever `~/.config/hypr/monitors.lua`, o plugin mantém as cinco cópias de backup mais recentes criadas por ele, com timestamp, ao lado do arquivo. Backups de outras ferramentas não são gerenciados.
+When rewriting `~/.config/hypr/monitors.lua`, the plugin keeps the five newest timestamped backups it created alongside the file. Backups created by other tools are not managed.
 
-Depois, remova o plugin pelo Omarchy:
+Then remove the plugin through Omarchy:
 
 ```bash
 omarchy plugin remove omarchy-display-order.display-order
 ```
 
-## Limitações
+## Limitations
 
-- O tratamento automático avançado de hotplug ainda não foi implementado.
-- A restauração depende de `order.json` e de um contexto de sessão/runtime válido do Hyprland.
-- Fora da renumeração temporária de workspaces base padrão elegíveis durante uma reordenação explícita, o plugin não cria nem gerencia permanentemente workspaces arbitrários.
+- Advanced automatic hotplug handling has not been implemented.
+- Restoration depends on `order.json` and valid Hyprland session/runtime context.
+- Outside the temporary renumbering of eligible default base workspaces during an explicit reorder, the plugin does not impose workspace numbering, create workspaces, or permanently manage arbitrary workspaces.
 
-## Desenvolvimento
+## Development
 
-Execute os checks a partir da raiz do plugin:
+Run these checks from the plugin root:
 
 ```bash
 bash -n scripts/reorder-displays
@@ -119,7 +121,7 @@ git diff --check
 omarchy plugin validate .
 ```
 
-Se `qmlformat` estiver instalado, formate ou valide os arquivos QML antes de contribuir:
+If `qmlformat` is installed, format or validate the QML files before contributing:
 
 ```bash
 qmlformat -i Panel.qml Service.qml MonitorIdentifier.qml
